@@ -1,0 +1,15 @@
+# Generated release packages
+dist/
+
+# Local/editor files
+.vscode/
+.vs/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.tmp
+*.bak
+*~

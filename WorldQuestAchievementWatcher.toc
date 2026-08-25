@@ -1,0 +1,41 @@
+## Interface: 120100
+## Title: World Quest Achievement Watcher
+## Notes: Alerts you when active world quests and rotating outdoor content can advance achievements.
+## Author: humra
+## Version: 1.0.0
+## X-Curse-Project-ID: 1667887
+## SavedVariables: WQAWDB
+## OptionalDeps: CanIMogIt, AllTheThings
+## IconTexture: Interface\Icons\INV_Misc_Map06
+
+embeds.xml
+Libs\LibQTip-1.0\LibQTip-1.0.lua
+
+Core.lua
+
+DB\Data\Legion.lua
+DB\Data\BattleForAzeroth.lua
+DB\Data\Shadowlands.lua
+DB\Data\Dragonflight.lua
+DB\Data\WarWithin.lua
+DB\Data\Midnight.lua
+
+DB\Expansions.lua
+DB\Zones.lua
+
+Criterias\CriteriaType.lua
+Criterias\AreaPoi.lua
+
+Rewards\RewardType.lua
+Rewards\Reward.lua
+
+Items\Miscellaneous.lua
+
+Achievements.lua
+
+Locales.lua
+Utilities.lua
+Tooltip.lua
+
+WorldQuestAchievementWatcher.lua
+Options.lua

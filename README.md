@@ -1,39 +1,19 @@
-# World Quest Achievement Watcher
+World Quest Achievement Watcher helps you find active World Quests and outdoor activities that are required for achievements.
 
-World Quest Achievement Watcher alerts you when active World of Warcraft content can advance achievements or other configured rewards.
+The addon checks your existing achievement progress and only highlights activities that are still relevant to you.
 
-Version 1.0.0 targets **World of Warcraft Retail 12.1.0** and includes compatibility work for current world-quest, Settings, reward-cache, Area POI, Event Scheduler, and outdoor-scenario behavior.
+#Features
 
-## Midnight coverage
+Detects active achievement-related world quests.
+Filters out criteria you have already completed.
+Support for Midnight zones up to and including The Coiled Isle.
+Supports optional transmog information from All The Things and CanIMogIt if you have them installed.
 
-Midnight tracking includes availability- or rotation-gated achievement content such as:
+#Commands
+/wqaw — show currently active relevant activities
+/wqaw new — show newly available activities
+/wqaw popup — show the popup window
+/wqaw debug — display troubleshooting information
 
-- Slayer's Rise world quests
-- Val and Naigtal Showdowns
-- achievement-related Special Assignments
-- Runestone Rush and Abundance rotations
-- Void Assault and Ritual Site rotations
-- Stormarion Assault
-- Cursed Surges on The Coiled Isle
-- Vaults of Atal'Utek Patrols, Strikes, Incursions, and Ancient Foes
-
-Completed achievements and completed criteria are filtered so the addon only reports content that can still advance your progress.
-
-## Commands
-
-- `/wqaw` - show currently interesting active content
-- `/wqaw new` - show newly detected content
-- `/wqaw popup` - show the popup view
-- `/wqaw debug` - show compact troubleshooting information
-
-Right-click the minimap icon to open World Quest Achievement Watcher settings.
-
-## Compatibility notes
-
-Some rotating Midnight activities are exposed by Blizzard through different APIs depending on their current state. World Quest Achievement Watcher can use normal map POIs and task quests, the Event Scheduler, and active outdoor scenarios. For example, an underway Cursed Surge can be detected from its outdoor scenario even when it is absent from the normal map/event feeds.
-
-## Project history
-
-World Quest Achievement Watcher is a separately named derivative of the original **WQAchievements** addon by **Urtgard**, whose CurseForge project is published as Public Domain. The original architecture and historical expansion data form the foundation of this project; Retail 12.1.0 compatibility and Midnight coverage were added for this version.
-
-See `credits.md` for additional original-project credits.
+#Credits
+World Quest Achievement Watcher is built upon the original WQAchievements addon by Urtgard, which was released into the Public Domain. Unfortunately the original add-on does not appear to be updated anymore so this one aims to replace it for game version 12.1. and newer.

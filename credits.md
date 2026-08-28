@@ -12,4 +12,4 @@ Original WQAchievements credits include:
 Retail 12.1.0 compatibility and Midnight achievement/event coverage were developed for World Quest Achievement Watcher while preserving the original project's attribution.
 
 
-World Quest Achievement Watcher is maintained by **humra**.
+World Quest Achievement Watcher is maintained by **humra7**.

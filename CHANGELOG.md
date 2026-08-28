@@ -1,6 +1,6 @@
 # World Quest Achievement Watcher Changelog
 
-## 1.0.4 - 2026-08-??
+## 1.0.4 - 2026-08-28
 
 Fixed a few missing or mismatched references in the code.
 Fixed localization strings still referring to WQA.

@@ -3,6 +3,7 @@
 ## 1.0.4 - 2026-08-??
 
 Fixed a few missing or mismatched references in the code.
+Fixed localization strings still referring to WQA.
 
 ## 1.0.3 - 2026-08-28
 

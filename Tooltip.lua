@@ -333,12 +333,30 @@ function WQA:UpdateQTip(tasks)
                                         ResetCursor()
                                     end
                                 )
+                                -- Capture the achievement ID for this specific reward cell.
+                                -- This avoids relying on the surrounding loop variables later
+                                -- when the user actually clicks the cell.
+                                local achievementID =
+                                    k == "achievement" and v[n] and v[n].id or nil
+
                                 tooltip:SetCellScript(
                                     i,
                                     j,
                                     "OnMouseDown",
-                                    function()
-                                        HandleModifiedItemClick(WQA:GetRewardLinkByID(id, k, v, n))
+                                    function(_, _, button)
+                                        local rewardLink = WQA:GetRewardLinkByID(id, k, v, n)
+
+                                        if
+                                            achievementID
+                                            and button == "LeftButton"
+                                            and not IsShiftKeyDown()
+                                            and not IsControlKeyDown()
+                                            and not IsAltKeyDown()
+                                        then
+                                            ShowAchievementFrameForAchievement(achievementID)
+                                        elseif rewardLink then
+                                            HandleModifiedItemClick(rewardLink)
+                                        end
                                     end
                                 )
                                 if n == 3 then
@@ -441,6 +459,7 @@ function WQA:AnnouncePopUp(quests, silent)
                 end
 
                 PopUp.shown = false
+                WQA.popupRequestActive = false
             end
         )
     end

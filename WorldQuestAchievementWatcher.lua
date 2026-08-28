@@ -628,14 +628,29 @@ function WQA:Show(mode, auto)
 		return
 	end
 	self:Debug("Show", mode)
+
+	if mode == "popup" then
+		self.popupRequestActive = true
+	end
+
 	self:CreateQuestList()
-	self.lastMode = mode
+
+	-- "popup" and "LDB" are transient UI requests. Do not remember them as
+	-- the mode that delayed reward/event processing should replay later.
+	if mode ~= "popup" and mode ~= "LDB" then
+		self.lastMode = mode
+	end
+
 	self:CheckWQ(mode)
 	self.first = true
 end
  
 function WQA:CheckWQ(mode)
-	self.lastMode = mode -- Store mode for passive updates
+	-- Passive reward/event callbacks use lastMode. Never let a manual popup
+	-- or minimap-tooltip request become the mode they replay later.
+	if mode ~= "popup" and mode ~= "LDB" then
+		self.lastMode = mode
+	end
 	self:Debug("CheckWQ")
  
 	-- Retail 12.1.0 can leave old item/reward data uncached indefinitely.
@@ -773,7 +788,9 @@ function WQA:CheckWQ(mode)
 			self:AnnouncePopUp(self.newTasks, self.first)
 		end
 	elseif mode == "popup" then
-		self:AnnouncePopUp(self.activeTasks)
+		if self.popupRequestActive then
+			self:AnnouncePopUp(self.activeTasks)
+		end
 	elseif mode == "LDB" then
 		self:AnnounceLDB(self.activeTasks)
 	else

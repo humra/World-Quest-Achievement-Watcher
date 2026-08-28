@@ -2059,6 +2059,7 @@ function WQA:AnnounceLDB(quests)
 				LibQTip:Release(WQA.tooltip)
 				WQA.tooltip.quests = nil
 				WQA.tooltip.missions = nil
+				WQA.tooltip.pois = nil
 				WQA.tooltip = nil
 			end
 		end

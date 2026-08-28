@@ -4,6 +4,25 @@ local WQA = WorldQuestAchievementWatcher
 local L = WQA.L
 local LibQTip = LibStub("LibQTip-1.0")
 
+-- Retail 12.x can propagate taint through Blizzard's global GameTooltip when
+-- addon-owned hover frames attach widget sets to it. Keep WQAW popup hover
+-- content on a private tooltip and never attach Blizzard widget sets to it.
+local wqawHoverTooltip
+
+local function GetHoverTooltip()
+    if not wqawHoverTooltip then
+        wqawHoverTooltip = CreateFrame(
+            "GameTooltip",
+            "WorldQuestAchievementWatcherHoverTooltip",
+            UIParent,
+            "GameTooltipTemplate"
+        )
+        wqawHoverTooltip:SetClampedToScreen(true)
+    end
+
+    return wqawHoverTooltip
+end
+
 
 function WQA:CreateQTip()
     if not LibQTip:IsAcquired("WorldQuestAchievementWatcher") and not self.tooltip then
@@ -59,9 +78,10 @@ function WQA:UpdateQTip(tasks)
         local expansion, zoneID
         for _, task in ipairs(tasks) do
             local id = task.id
+            local poiKey = task.type == "AREA_POI" and (tostring(task.mapId) .. ":" .. tostring(id)) or nil
             if
                 (task.type == "WORLD_QUEST" and not tooltip.quests[id]) or (task.type == "MISSION" and not tooltip.missions[id]) or
-                (task.type == "AREA_POI" and not tooltip.pois[id])
+                (task.type == "AREA_POI" and not tooltip.pois[poiKey])
             then
                 local j = 1
 
@@ -98,6 +118,8 @@ function WQA:UpdateQTip(tasks)
                     tooltip.quests[id] = true
                 elseif task.type == "MISSION" then
                     tooltip.missions[id] = true
+                elseif task.type == "AREA_POI" then
+                    tooltip.pois[poiKey] = true
                 end
 
                 local link = self:GetTaskLink(task)
@@ -108,35 +130,31 @@ function WQA:UpdateQTip(tasks)
                     j,
                     "OnEnter",
                     function(self)
-                        GameTooltip_SetDefaultAnchor(GameTooltip, self)
-                        GameTooltip:ClearLines()
-                        GameTooltip:ClearAllPoints()
-                        GameTooltip:SetPoint("BOTTOMLEFT", self, "TOPLEFT", 0, 0)
+                        local hoverTooltip = GetHoverTooltip()
+                        hoverTooltip:SetOwner(self, "ANCHOR_NONE")
+                        hoverTooltip:ClearLines()
+                        hoverTooltip:ClearAllPoints()
+                        hoverTooltip:SetPoint("BOTTOMLEFT", self, "TOPLEFT", 0, 0)
                         if task.type == "WORLD_QUEST" then
                             if string.find(link, "|Hquest:") then
-                                GameTooltip:SetHyperlink(link)
+                                hoverTooltip:SetHyperlink(link)
                             end
                         elseif task.type == "MISSION" then
-                            GameTooltip:SetText(C_Garrison.GetMissionName(id))
-                            GameTooltip:AddLine(
+                            hoverTooltip:SetText(C_Garrison.GetMissionName(id))
+                            hoverTooltip:AddLine(
                                 string.format(GARRISON_MISSION_TOOLTIP_NUM_REQUIRED_FOLLOWERS,
                                     C_Garrison.GetMissionMaxFollowers(id)),
                                 1,
                                 1,
                                 1
                             )
-                            GarrisonMissionButton_AddThreatsToTooltip(
-                                id,
-                                WQA.missionList[task.id].followerType,
-                                false,
-                                C_Garrison.GetFollowerAbilityCountersForMechanicTypes(WQA.missionList[task.id]
-                                    .followerType)
-                            )
-                            GameTooltip:AddLine(GARRISON_MISSION_AVAILABILITY)
-                            GameTooltip:AddLine(WQA.missionList[task.id].offerTimeRemaining, 1, 1, 1)
+                            -- Threat details are intentionally omitted here because
+                            -- Blizzard's legacy helper writes to the global GameTooltip.
+                            hoverTooltip:AddLine(GARRISON_MISSION_AVAILABILITY)
+                            hoverTooltip:AddLine(WQA.missionList[task.id].offerTimeRemaining, 1, 1, 1)
                             if not C_Garrison.IsPlayerInGarrison(WQA.missionList[task.id].followerType) then
-                                GameTooltip:AddLine(" ")
-                                GameTooltip:AddLine(
+                                hoverTooltip:AddLine(" ")
+                                hoverTooltip:AddLine(
                                     GarrisonFollowerOptions[WQA.missionList[task.id].followerType].strings
                                     .RETURN_TO_START,
                                     nil,
@@ -155,10 +173,10 @@ function WQA:UpdateQTip(tasks)
                                 return
                             end
 
-                            GameTooltip_SetTitle(GameTooltip, displayName, HIGHLIGHT_FONT_COLOR)
+                            GameTooltip_SetTitle(hoverTooltip, displayName, HIGHLIGHT_FONT_COLOR)
 
                             if poiInfo and poiInfo.description then
-                                GameTooltip_AddNormalLine(GameTooltip, poiInfo.description)
+                                GameTooltip_AddNormalLine(hoverTooltip, poiInfo.description)
                             end
 
                             local tooltipSecondsLeft
@@ -170,28 +188,29 @@ function WQA:UpdateQTip(tasks)
                             end
                             if tooltipSecondsLeft and tooltipSecondsLeft > 0 then
                                 local timeString = SecondsToTime(tooltipSecondsLeft)
-                                GameTooltip_AddNormalLine(GameTooltip, BONUS_OBJECTIVE_TIME_LEFT:format(timeString))
+                                GameTooltip_AddNormalLine(hoverTooltip, BONUS_OBJECTIVE_TIME_LEFT:format(timeString))
                             end
 
                             local textureKit = poiInfo and (poiInfo.uiTextureKit or poiInfo.textureKit) or nil
                             if textureKit == "OribosGreatVault" then
-                                GameTooltip_AddBlankLineToTooltip(GameTooltip)
-                                GameTooltip_AddInstructionLine(GameTooltip, ORIBOS_GREAT_VAULT_POI_TOOLTIP_INSTRUCTIONS)
+                                GameTooltip_AddBlankLineToTooltip(hoverTooltip)
+                                GameTooltip_AddInstructionLine(hoverTooltip, ORIBOS_GREAT_VAULT_POI_TOOLTIP_INSTRUCTIONS)
                             end
 
                             local widgetSetID = poiInfo and (poiInfo.tooltipWidgetSet or poiInfo.widgetSetID) or nil
                             if widgetSetID then
-                                GameTooltip_AddWidgetSet(GameTooltip, widgetSetID, 10)
+                                -- Intentionally omitted. Blizzard widget layouts may
+                                -- contain secret values and must stay on Blizzard-owned UI.
                             end
 
                             if textureKit then
                                 local backdropStyle = GAME_TOOLTIP_TEXTUREKIT_BACKDROP_STYLES[textureKit]
                                 if (backdropStyle) then
-                                    SharedTooltip_SetBackdropStyle(GameTooltip, backdropStyle)
+                                    SharedTooltip_SetBackdropStyle(hoverTooltip, backdropStyle)
                                 end
                             end
                         end
-                        GameTooltip:Show()
+                        hoverTooltip:Show()
                     end
                 )
                 tooltip:SetCellScript(
@@ -199,7 +218,7 @@ function WQA:UpdateQTip(tasks)
                     j,
                     "OnLeave",
                     function()
-                        GameTooltip:Hide()
+                        GetHoverTooltip():Hide()
                     end
                 )
                 tooltip:SetCellScript(
@@ -290,21 +309,19 @@ function WQA:UpdateQTip(tasks)
                                     j,
                                     "OnEnter",
                                     function(self)
-                                        GameTooltip:SetOwner(self, "ANCHOR_NONE")
-                                        GameTooltip:ClearLines()
-                                        ContainerFrameItemButton_CalculateItemTooltipAnchors(self, GameTooltip)
+                                        local hoverTooltip = GetHoverTooltip()
+                                        hoverTooltip:SetOwner(self, "ANCHOR_NONE")
+                                        hoverTooltip:ClearLines()
+                                        ContainerFrameItemButton_CalculateItemTooltipAnchors(self, hoverTooltip)
 
                                         if WQA:GetRewardLinkByID(id, k, v, n) then
-                                            GameTooltip:SetHyperlink(WQA:GetRewardLinkByID(id, k, v, n))
+                                            hoverTooltip:SetHyperlink(WQA:GetRewardLinkByID(id, k, v, n))
                                         else
-                                            GameTooltip:SetText(WQA:GetRewardTextByID(id, k, v, n, task.type))
+                                            hoverTooltip:SetText(WQA:GetRewardTextByID(id, k, v, n, task.type))
                                         end
-                                        GameTooltip:Show()
-                                        if (IsModifiedClick("COMPAREITEMS") or GetCVarBool("alwaysCompareItems")) and k == "item" then
-                                            GameTooltip_ShowCompareItem()
-                                        else
-                                            GameTooltip_HideShoppingTooltips(GameTooltip)
-                                        end
+                                        hoverTooltip:Show()
+                                        -- Comparison shopping tooltips are intentionally
+                                        -- omitted to keep WQAW isolated from GameTooltip.
                                     end
                                 )
                                 tooltip:SetCellScript(
@@ -312,7 +329,8 @@ function WQA:UpdateQTip(tasks)
                                     j,
                                     "OnLeave",
                                     function()
-                                        GameTooltip_HideResetCursor()
+                                        GetHoverTooltip():Hide()
+                                        ResetCursor()
                                     end
                                 )
                                 tooltip:SetCellScript(
@@ -348,12 +366,13 @@ function WQA:UpdateQTip(tasks)
                                             j,
                                             "OnEnter",
                                             function(self)
-                                                GameTooltip_SetDefaultAnchor(GameTooltip, self)
-                                                GameTooltip:ClearLines()
-                                                GameTooltip:ClearAllPoints()
-                                                GameTooltip:SetPoint("BOTTOMLEFT", self, "TOPLEFT", 0, 0)
-                                                GameTooltip:SetText(moreTooltipText)
-                                                GameTooltip:Show()
+                                                local hoverTooltip = GetHoverTooltip()
+                                                hoverTooltip:SetOwner(self, "ANCHOR_NONE")
+                                                hoverTooltip:ClearLines()
+                                                hoverTooltip:ClearAllPoints()
+                                                hoverTooltip:SetPoint("BOTTOMLEFT", self, "TOPLEFT", 0, 0)
+                                                hoverTooltip:SetText(moreTooltipText)
+                                                hoverTooltip:Show()
                                             end
                                         )
                                         tooltip:SetCellScript(
@@ -361,7 +380,7 @@ function WQA:UpdateQTip(tasks)
                                             j,
                                             "OnLeave",
                                             function()
-                                                GameTooltip:Hide()
+                                                GetHoverTooltip():Hide()
                                             end
                                         )
                                     end
@@ -417,6 +436,7 @@ function WQA:AnnouncePopUp(quests, silent)
                     LibQTip:Release(WQA.tooltip)
                     WQA.tooltip.quests = nil
                     WQA.tooltip.missions = nil
+                    WQA.tooltip.pois = nil
                     WQA.tooltip = nil
                 end
 

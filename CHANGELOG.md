@@ -1,5 +1,9 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.0.4 - 2026-08-??
+
+Fixed a few missing or mismatched references in the code.
+
 ## 1.0.3 - 2026-08-28
 
 Clicking on the achievement name in the add-on interface will now open the relevant achievement details.

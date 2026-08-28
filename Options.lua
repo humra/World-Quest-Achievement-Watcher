@@ -704,7 +704,7 @@ function WQA:UpdateOptions()
 					desc1 = {
 						type = "description",
 						fontSize = "medium",
-						name = L["Select where WQA is allowed to post"],
+						name = L["Select where WQAW is allowed to post"],
 						order = newOrder()
 					},
 					chat = {

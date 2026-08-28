@@ -2,11 +2,11 @@
 ## Title: World Quest Achievement Watcher
 ## Notes: Alerts you when active world quests and rotating outdoor content can advance achievements.
 ## Author: humra7
-## Version: 1.0.3
+## Version: 1.0.4
 ## X-Curse-Project-ID: 1667887
 ## SavedVariables: WQAWDB
 ## OptionalDeps: CanIMogIt, AllTheThings
-## IconTexture: Interface\Icons\INV_Misc_Map06
+## IconTexture: Interface\Icons\INV_Misc_Map04
 
 embeds.xml
 Libs\LibQTip-1.0\LibQTip-1.0.lua

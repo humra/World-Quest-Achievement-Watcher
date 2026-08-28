@@ -1,5 +1,9 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.0.5 - 2026-08-29
+
+Removed GameTooltipTemplate references from the addon which caused secret-value tooltip taint errors.
+
 ## 1.0.4 - 2026-08-28
 
 Fixed a few missing or mismatched references in the code.

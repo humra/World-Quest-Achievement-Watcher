@@ -192,6 +192,13 @@ end
 
 function WQA:GetTaskTime(task)
     if task.type == "WORLD_QUEST" then
+        -- Prefer the absolute expiry captured by the last successful full scan.
+        -- This keeps ordinary minimap hover/popup rendering local-only instead
+        -- of touching C_TaskQuest every time the list is displayed.
+        if type(task.expiresAt) == "number" then
+            local now = GetServerTime and GetServerTime() or time()
+            return math.max(0, task.expiresAt - now) / 60
+        end
         return C_TaskQuest.GetQuestTimeLeftMinutes(task.id)
     elseif task.type == "MISSION" then
         return self:GetMissionTimeLeftMinutes(task.id)

@@ -272,68 +272,69 @@ function WQA:GetScenarioAreaPoiInfo(poiID, mapID)
     return eventInfo
 end
 
-function WQA:OnEnable()
-	local name, server = UnitFullName("player")
-	self.playerName = name .. "-" .. server
-	------------------
-	-- 	Options
-	------------------
+function WQA:EnsureOptionsRegistered()
+	if self.optionsRegistered then
+		return true
+	end
+
+	-- Do not expose the full dynamic options tree to Blizzard Settings during
+	-- login. It resolves many achievement/item/quest labels and can cause a
+	-- large asynchronous data-loading burst even when no WQ scan is running.
 	LibStub("AceConfig-3.0"):RegisterOptionsTable(
 		"WorldQuestAchievementWatcher",
 		function()
 			return self:GetOptions()
 		end
 	)
-	self.optionsFrame, self.optionsCategoryID = LibStub("AceConfigDialog-3.0"):AddToBlizOptions("WorldQuestAchievementWatcher", "World Quest Achievement Watcher")
+	self.optionsFrame, self.optionsCategoryID = LibStub("AceConfigDialog-3.0"):AddToBlizOptions(
+		"WorldQuestAchievementWatcher",
+		"World Quest Achievement Watcher"
+	)
+
 	local profiles = LibStub("AceDBOptions-3.0"):GetOptionsTable(self.db)
 	LibStub("AceConfig-3.0"):RegisterOptionsTable("WQAWProfiles", profiles)
-	self.optionsFrame.Profiles =
-		LibStub("AceConfigDialog-3.0"):AddToBlizOptions("WQAWProfiles", "Profiles", "World Quest Achievement Watcher")
- 
+	self.optionsFrame.Profiles = LibStub("AceConfigDialog-3.0"):AddToBlizOptions(
+		"WQAWProfiles",
+		"Profiles",
+		"World Quest Achievement Watcher"
+	)
+
+	self.optionsRegistered = true
+	self:Debug("Options registered on demand")
+	return true
+end
+
+function WQA:OnEnable()
+	local name, server = UnitFullName("player")
+	self.playerName = name .. "-" .. server
+
+	-- Keep login initialization intentionally minimal. Settings registration is
+	-- deferred until the player explicitly opens WQAW options.
 	self.event = CreateFrame("Frame")
 	self.event:RegisterEvent("PLAYER_ENTERING_WORLD")
-	self.event:RegisterEvent("GARRISON_MISSION_LIST_UPDATE")
-	self.event:RegisterEvent("EVENT_SCHEDULER_UPDATE")
-	self.event:RegisterEvent("SCENARIO_UPDATE")
-	self.event:RegisterEvent("SCENARIO_COMPLETED")
-	self.event:RegisterEvent("TRANSMOG_COLLECTION_SOURCE_ADDED")
-	self.event:RegisterEvent("TRANSMOG_COLLECTION_UPDATED")
+	-- Garrison/mission, Event Scheduler, and scenario events are deliberately
+	-- registered later, inside the first safe discovery window. Loading and
+	-- servicing those systems during PLAYER_ENTERING_WORLD can create a long
+	-- burst of Blizzard UI/data updates while the player is using quest NPCs.
+	self.event:RegisterEvent("QUEST_TURNED_IN")
+	-- Transmog listeners are registered only in the first safe refresh window.
 	self.event:SetScript(
 		"OnEvent",
 		function(...)
 			local _, name, id, arg2, arg3, arg4 = ...
 			if name == "PLAYER_ENTERING_WORLD" then
-				self:ScheduleTimer(
-					function()
-						for _, zoneList in pairs(self.ZoneIDList) do
-							for _, mapID in pairs(zoneList) do
-								if self.db.profile.options.zone[mapID] == true then
-									local quests = C_TaskQuest.GetQuestsOnMap(mapID)
-									if quests then
-										for j = 1, #quests do
-											local questID = quests[j].questID
-											local numQuestRewards = GetNumQuestLogRewards(questID)
-											if numQuestRewards > 0 then
-												GetQuestLogRewardInfo(1, questID)
-											end
-										end
-									end
-								end
-							end
-						end
-					end,
-					self.db.profile.options.delay
-				)
- 
+				-- Login path: restore only local SavedVariables state, then become
+				-- idle. No scan, Settings tree, collection listener, reward request,
+				-- or repeating timer is started here.
 				self.event:UnregisterEvent("PLAYER_ENTERING_WORLD")
-				self:ScheduleTimer("Show", self.db.profile.options.delay + 1, nil, true)
-				self:ScheduleTimer(
-					function()
-						self:Show("new", true)
-						self:ScheduleRepeatingTimer("Show", 30 * 60, "new", true)
-					end,
-					(32 - (date("%M") % 30)) * 60
-				)
+				self:LoadPersistentDisplayCache()
+				self.first = true
+				self.quietStartupActive = true
+				-- Do not arm a full discovery scan for the next World Map open.
+				-- C_TaskQuest map/reward requests can keep Blizzard's quest system
+				-- busy even after the map closes. Full scans are manual-only.
+				self.pendingSafeDiscoveryMode = nil
+				self.fullRefreshExplicitlyRequested = false
 			elseif name == "QUEST_LOG_UPDATE" or name == "GET_ITEM_INFO_RECEIVED" then
 				-- Debounce to prevent rapid-fire reward processing
 				if self.rewardDebounceTimer then
@@ -351,83 +352,108 @@ function WQA:OnEnable()
 				self.deferredShowMode = nil
 				self:Show(deferredMode, true)
 			elseif name == "QUEST_TURNED_IN" then
-				self.db.global.completed[id] = true
+				self:HandleQuestTurnedIn(id)
 			elseif name == "GARRISON_MISSION_LIST_UPDATE" then
-				self:CheckMissions()
+				-- Do not inspect mission rewards directly from this event. Blizzard can
+				-- fire it repeatedly while mission data is being initialized. Mark the
+				-- snapshot dirty and fold it into the next safe full refresh instead.
+				self.missionsDirty = true
+				self.pendingSafeDiscoveryMode = self.pendingSafeDiscoveryMode or "new"
+				if self.fullRefreshExplicitlyRequested and self:IsSafeWorldQuestDiscoveryWindow() then
+					self:TryStartSafeDiscovery()
+				end
 			elseif name == "EVENT_SCHEDULER_UPDATE" then
-				self:RefreshEventSchedulerCache()
-				-- The first normal startup scan is already scheduled by
-				-- PLAYER_ENTERING_WORLD. After that, react quickly when the
-				-- Events tab rotates to a new outdoor event.
-				if self.first then
-					if self.eventSchedulerDebounceTimer then
-						self:CancelTimer(self.eventSchedulerDebounceTimer)
-					end
-					self.eventSchedulerDebounceTimer = self:ScheduleTimer(function()
-						self:Show("new", true)
-					end, 0.5)
+				-- Scheduler updates are asynchronous and can arrive in bursts. Do not
+				-- query AreaPOI/event data from them during normal play.
+				self.eventSchedulerDirty = true
+				self.pendingSafeDiscoveryMode = self.pendingSafeDiscoveryMode or "new"
+				if self.fullRefreshExplicitlyRequested and self:IsSafeWorldQuestDiscoveryWindow() then
+					self:TryStartSafeDiscovery()
 				end
 			elseif name == "TRANSMOG_COLLECTION_SOURCE_ADDED" or name == "TRANSMOG_COLLECTION_UPDATED" then
-				-- Targeted transmog refresh:
-				-- only rescan when the learned appearance/source is currently relevant
-				-- to a transmog reward on an active world quest WQAW is tracking.
-				--
-				-- TRANSMOG_COLLECTION_SOURCE_ADDED:
-				--   id = itemModifiedAppearanceID (source ID)
-				--
-				-- TRANSMOG_COLLECTION_UPDATED:
-				--   id   = collectionIndex
-				--   arg2 = modID
-				--   arg3 = itemAppearanceID
-				--   arg4 = reason
 				if self.first and self.db.profile.options.reward.gear.unknownAppearance then
-					local relevant = false
-
+					local affected = {}
 					if name == "TRANSMOG_COLLECTION_SOURCE_ADDED" then
-						relevant = self:IsTrackedTransmogSourceRelevant(id)
+						affected = self:GetTrackedTransmogQuestIDsForSource(id)
 					elseif name == "TRANSMOG_COLLECTION_UPDATED" and arg3 then
-						relevant = self.activeTransmogAppearanceIDs
-							and self.activeTransmogAppearanceIDs[arg3] == true
+						affected = MergeQuestIDSet(affected, self.activeTransmogAppearanceQuestIDs and self.activeTransmogAppearanceQuestIDs[arg3])
 					end
 
-					if relevant then
+					if next(affected) then
+						self.pendingTransmogQuestRefresh = MergeQuestIDSet(self.pendingTransmogQuestRefresh or {}, affected)
 						if self.transmogRefreshTimer then
 							self:CancelTimer(self.transmogRefreshTimer)
 						end
-
-						self:Debug("Relevant transmog collection changed - scheduling silent refresh")
 						self.transmogRefreshTimer = self:ScheduleTimer(function()
 							self.transmogRefreshTimer = nil
-							self:Debug("Refreshing after relevant transmog collection change")
-							self:Show("silent", true)
+							local quests = self.pendingTransmogQuestRefresh or {}
+							self.pendingTransmogQuestRefresh = nil
+							self:RefreshTrackedTransmogQuests(quests)
 						end, 3)
 					end
 				end
 			elseif name == "SCENARIO_UPDATE" or name == "SCENARIO_COMPLETED" then
-				-- Outdoor public events such as Cursed Surges can be visible
-				-- only through C_ScenarioInfo during their active phases.
-				-- Rebuild the dynamic event registrations when that scenario
-				-- starts, changes stage, or completes.
-				if self.first then
-					if self.scenarioDebounceTimer then
-						self:CancelTimer(self.scenarioDebounceTimer)
-					end
-					self.scenarioDebounceTimer = self:ScheduleTimer(function()
-						self:Show("new", true)
-					end, 0.5)
+				self.scenarioDirty = true
+				self.pendingSafeDiscoveryMode = self.pendingSafeDiscoveryMode or "new"
+				if self.fullRefreshExplicitlyRequested and self:IsSafeWorldQuestDiscoveryWindow() then
+					self:TryStartSafeDiscovery()
 				end
 			end
 		end
 	)
- 
-	if C_EventScheduler and C_EventScheduler.RequestEvents then
-		C_EventScheduler.RequestEvents()
-		if not C_EventScheduler.HasData or C_EventScheduler.HasData() then
-			self:RefreshEventSchedulerCache()
-		end
+
+	-- Retail's World Map and Quest Log share WorldMapFrame. WorldMapOnShow fires
+	-- for both, so it must NOT be used as a scan trigger. Only an explicit
+	-- ToggleWorldMap action arms the map refresh window.
+	if type(ToggleWorldMap) == "function" and not self.worldMapToggleHookInstalled then
+		self.worldMapToggleHookInstalled = true
+		hooksecurefunc("ToggleWorldMap", function()
+			self:ScheduleTimer(function()
+				if WorldMapFrame and WorldMapFrame:IsShown() then
+					self.explicitWorldMapRefreshWindow = true
+					self.lastSafeWindowReason = "ToggleWorldMap"
+
+					-- Opening M by itself is passive. Only resume/start a cross-
+					-- expansion scan when the player explicitly requested one with
+					-- /wqaw refresh.
+					if self.fullRefreshExplicitlyRequested then
+						self:TryStartSafeDiscovery()
+					end
+				else
+					self.explicitWorldMapRefreshWindow = false
+				end
+			end, 0.05)
+		end)
 	end
 
-	C_AddOns.LoadAddOn("Blizzard_GarrisonUI")
+	if EventRegistry and EventRegistry.RegisterCallback then
+		EventRegistry:RegisterCallback("WorldMapOnHide", function()
+			self.explicitWorldMapRefreshWindow = false
+		end, self)
+	end
+
+	-- If quest details are opened while a map refresh is running, the scan will
+	-- pause. Resume after the detail panel closes.
+	local function ResumeAfterQuestDetails()
+		self:ScheduleTimer(function()
+			if self.explicitWorldMapRefreshWindow and self.fullRefreshExplicitlyRequested then
+				self:TryStartSafeDiscovery()
+			end
+		end, 0.05)
+	end
+
+	if QuestMapFrame and QuestMapFrame.DetailsFrame and not self.questMapDetailsHookInstalled then
+		self.questMapDetailsHookInstalled = true
+		QuestMapFrame.DetailsFrame:HookScript("OnHide", ResumeAfterQuestDetails)
+	end
+
+	if QuestLogPopupDetailFrame and not self.questLogPopupHookInstalled then
+		self.questLogPopupHookInstalled = true
+		QuestLogPopupDetailFrame:HookScript("OnHide", ResumeAfterQuestDetails)
+	end
+
+	-- Event Scheduler and Blizzard_GarrisonUI are intentionally NOT initialized
+	-- here. They are deferred until the first safe World Map/taxi refresh.
 end
  
 WQA:RegisterChatCommand("wqaw", "slash")
@@ -436,11 +462,26 @@ function WQA:slash(input)
 	local arg1 = string.lower(input or "")
 
 	if arg1 == "" then
-		self:Show()
+		self:AnnounceChat(self.activeTasks or {})
 	elseif arg1 == "new" then
-		self:Show("new")
+		self:AnnounceChat(self.newTasks or {})
+	elseif arg1 == "refresh" then
+		self.pendingSafeDiscoveryMode = "new"
+		self.fullRefreshExplicitlyRequested = true
+		self.lastSafeWindowReason = "manual /wqaw refresh"
+
+		if WorldMapFrame and WorldMapFrame:IsShown() and not self:IsQuestLogDetailActive() then
+			self.explicitWorldMapRefreshWindow = true
+		end
+
+		if not self:TryStartSafeDiscovery() then
+			print("|cff33ff99WQAW:|r Full refresh requested. Open the World Map (M) and leave it open until the scan finishes.")
+		end
 	elseif arg1 == "popup" then
 		self:Show("popup")
+	elseif arg1 == "options" then
+		self:EnsureOptionsRegistered()
+		Settings.OpenToCategory(self.optionsCategoryID or (self.optionsFrame and self.optionsFrame.name))
 	elseif arg1 == "debug" then
 		local version = "unknown"
 		if C_AddOns and C_AddOns.GetAddOnMetadata then
@@ -451,6 +492,30 @@ function WQA:slash(input)
 		print("Rewards ready: " .. tostring(self.rewards))
 		print("Emissary rewards ready: " .. tostring(self.emissaryRewards))
 		print("Pending reward quests: " .. (function() local n=0 for _ in pairs(self.pendingQuests or {}) do n=n+1 end return n end)())
+		print("Reward preload queue: " .. tostring(self.rewardPreloadQueue and #self.rewardPreloadQueue or 0))
+		print("Reward preload requests this scan: " .. tostring(self.rewardPreloadRequestsThisScan or 0))
+		print("Reward preload paused for quest UI: " .. tostring(self.rewardPreloadPausedForQuestUI == true))
+		print("World quest discovery scan active: " .. tostring(self.rewardScanInProgress == true))
+		print("World quest discovery maps: " .. tostring(self.rewardScanMapsProcessed or 0) .. "/" .. tostring(self.rewardScanMaps and #self.rewardScanMaps or 0))
+		print("World quest discovery quests processed: " .. tostring(self.rewardScanQuestsProcessed or 0))
+		print("World quest discovery paused for quest UI: " .. tostring(self.rewardScanPausedForQuestUI == true))
+		print("World quest discovery paused for safe window: " .. tostring(self.rewardScanPausedForSafeWindow == true))
+		print("World quest safe window active: " .. tostring(self:IsSafeWorldQuestDiscoveryWindow()))
+		print("Explicit World Map refresh window: " .. tostring(self.explicitWorldMapRefreshWindow == true))
+		print("Full refresh explicitly requested: " .. tostring(self.fullRefreshExplicitlyRequested == true))
+		print("Pending full refresh mode: " .. tostring(self.pendingSafeDiscoveryMode or "none"))
+		print(self:GetLastFullScanStatusText())
+		print("Full scan timestamp type: " .. type(self.worldQuestFullScanCompletedAt))
+		print("Cached expiry timer active: " .. tostring(self.cachedWorldQuestExpiryTimer ~= nil))
+		print("Quest log detail active: " .. tostring(self:IsQuestLogDetailActive()))
+		print("Safe window reason: " .. tostring(self.lastSafeWindowReason or "none"))
+		print("Persistent display cache available: " .. tostring(type(self.db.char.worldQuestDisplayCache) == "table" and type(self.db.char.worldQuestDisplayCache.activeTasks) == "table"))
+		print("Quiet startup active: " .. tostring(self.quietStartupActive == true))
+		print("Deferred data sources initialized: " .. tostring(self.deferredDataSourcesInitialized == true))
+		print("Options registered: " .. tostring(self.optionsRegistered == true))
+		print("Transmog listeners registered: " .. tostring(self.transmogListenersRegistered == true))
+		print("Periodic refresh timer initialized: " .. tostring(self.periodicRefreshScheduled == true))
+		print("Reward pending paused for safe window: " .. tostring(self.rewardPendingPausedForSafeWindow == true))
 		print("Registered tracked quests: " .. (function() local n=0 for _ in pairs(self.questList or {}) do n=n+1 end return n end)())
 		print("Chat output enabled: " .. tostring(self.db and self.db.profile.options.chat))
 		print("Active scheduler events: " .. tostring(#(self.eventSchedulerOngoing or {})))
@@ -461,7 +526,7 @@ function WQA:slash(input)
 			print("Active outdoor scenario: none")
 		end
 	else
-		print("|cff33ff99World Quest Achievement Watcher commands:|r /wqaw, /wqaw new, /wqaw popup, /wqaw debug")
+		print("|cff33ff99World Quest Achievement Watcher commands:|r /wqaw, /wqaw new, /wqaw refresh, /wqaw popup, /wqaw options, /wqaw debug")
 	end
 end
 
@@ -470,13 +535,18 @@ function WQA:CreateQuestList()
 	if C_EventScheduler and C_EventScheduler.GetOngoingEvents and
 		(not C_EventScheduler.HasData or C_EventScheduler.HasData()) then
 		self:RefreshEventSchedulerCache()
+		self.eventSchedulerDirty = false
 	end
+	self.scenarioDirty = false
+	self.missionsDirty = false
 	self.questList = {}
 	-- Rebuilt on every full scan. These contain only transmog rewards currently
 	-- relevant to active world quests, so unrelated collection changes do not
 	-- trigger an expensive refresh.
 	self.activeTransmogAppearanceIDs = {}
 	self.activeTransmogSourceIDs = {}
+	self.activeTransmogAppearanceQuestIDs = {}
+	self.activeTransmogSourceQuestIDs = {}
 	self.questPinList = {}
 	self.questPinMapList = {}
 	self.missionList = {}
@@ -509,7 +579,7 @@ function WQA:CreateQuestList()
 	self:AddCustom()
 	self:Special()
 	self:Reward()
-	self:EmissaryReward()
+	-- Emissary rewards are scanned after the paced world-quest discovery pass.
 end
  
 function WQA:AddMounts(mounts)
@@ -679,6 +749,8 @@ function WQA:CaptureQuestRefreshState()
 		emissaryRewards = self.emissaryRewards,
 		activeTransmogAppearanceIDs = self.activeTransmogAppearanceIDs,
 		activeTransmogSourceIDs = self.activeTransmogSourceIDs,
+		activeTransmogAppearanceQuestIDs = self.activeTransmogAppearanceQuestIDs,
+		activeTransmogSourceQuestIDs = self.activeTransmogSourceQuestIDs,
 		activeTasks = self.activeTasks,
 		newTasks = self.newTasks,
 	}
@@ -700,8 +772,360 @@ function WQA:ApplyQuestRefreshState(state)
 	self.emissaryRewards = state.emissaryRewards
 	self.activeTransmogAppearanceIDs = state.activeTransmogAppearanceIDs
 	self.activeTransmogSourceIDs = state.activeTransmogSourceIDs
+	self.activeTransmogAppearanceQuestIDs = state.activeTransmogAppearanceQuestIDs
+	self.activeTransmogSourceQuestIDs = state.activeTransmogSourceQuestIDs
 	self.activeTasks = state.activeTasks
 	self.newTasks = state.newTasks
+end
+
+local function CopyPersistentValue(value, seen)
+	local valueType = type(value)
+	if valueType ~= "table" then
+		if valueType == "number" or valueType == "string" or valueType == "boolean" then
+			return value
+		end
+		return nil
+	end
+
+	seen = seen or {}
+	if seen[value] then
+		return seen[value]
+	end
+
+	local result = {}
+	seen[value] = result
+	for key, child in pairs(value) do
+		local copiedKey = CopyPersistentValue(key, seen)
+		local copiedValue = CopyPersistentValue(child, seen)
+		if copiedKey ~= nil and copiedValue ~= nil then
+			result[copiedKey] = copiedValue
+		end
+	end
+	return result
+end
+
+function WQA:IsQuestLogDetailActive()
+	if QuestLogPopupDetailFrame
+		and QuestLogPopupDetailFrame.IsShown
+		and QuestLogPopupDetailFrame:IsShown()
+	then
+		return true
+	end
+
+	if QuestMapFrame
+		and QuestMapFrame.DetailsFrame
+		and QuestMapFrame.DetailsFrame.IsShown
+		and QuestMapFrame.DetailsFrame:IsShown()
+		and QuestMapFrame.DetailsFrame.questID
+	then
+		return true
+	end
+
+	return false
+end
+
+function WQA:IsSafeWorldQuestDiscoveryWindow()
+	if UnitOnTaxi and UnitOnTaxi("player") then
+		return not self:IsQuestLogDetailActive()
+	end
+
+	-- WorldMapFrame is also the Quest Log parent in Retail. It is only a safe
+	-- WQAW refresh window when the player explicitly opened the World Map and is
+	-- not currently viewing a quest-detail panel.
+	if self.explicitWorldMapRefreshWindow
+		and WorldMapFrame
+		and WorldMapFrame.IsShown
+		and WorldMapFrame:IsShown()
+		and not self:IsQuestLogDetailActive()
+	then
+		return true
+	end
+
+	return false
+end
+
+function WQA:SavePersistentDisplayCache()
+	if not self.activeTasks or not self.questList then
+		return
+	end
+
+	local now = GetServerTime and GetServerTime() or time()
+	local previous = self.db.char.worldQuestDisplayCache
+	local previousExpiry = {}
+	if type(previous) == "table" and type(previous.activeTasks) == "table" then
+		for _, task in ipairs(previous.activeTasks) do
+			if task.type == "WORLD_QUEST" and task.expiresAt then
+				previousExpiry[task.id] = task.expiresAt
+			end
+		end
+	end
+
+	-- Stamp expiry onto the live committed task objects as well as the
+	-- persistent copy. During an explicit safe full scan the Blizzard API is
+	-- allowed to provide fresh time-left data; outside that window we preserve
+	-- the previously known absolute expiry and do not query the quest API.
+	for _, task in ipairs(self.activeTasks) do
+		if task.type == "WORLD_QUEST" then
+			local expiresAt = task.expiresAt or previousExpiry[task.id]
+			if self:IsSafeWorldQuestDiscoveryWindow() and C_TaskQuest.GetQuestTimeLeftMinutes then
+				local minutes = C_TaskQuest.GetQuestTimeLeftMinutes(task.id)
+				if minutes and minutes > 0 then
+					expiresAt = now + (minutes * 60)
+				end
+			end
+			task.expiresAt = expiresAt
+		end
+	end
+
+	local cachedTasks = CopyPersistentValue(self.activeTasks) or {}
+
+	self.db.char.worldQuestDisplayCache = {
+		version = 1,
+		savedAt = now,
+		fullScanCompletedAt = type(self.worldQuestFullScanCompletedAt) == "number"
+			and self.worldQuestFullScanCompletedAt
+			or nil,
+		questList = CopyPersistentValue(self.questList) or {},
+		questPinList = CopyPersistentValue(self.questPinList) or {},
+		questPinMapList = CopyPersistentValue(self.questPinMapList) or {},
+		missionList = CopyPersistentValue(self.missionList) or {},
+		questFlagList = CopyPersistentValue(self.questFlagList) or {},
+		areaPoiList = CopyPersistentValue(self.Criterias.AreaPoi.list) or {},
+		activeTransmogAppearanceIDs = CopyPersistentValue(self.activeTransmogAppearanceIDs) or {},
+		activeTransmogSourceIDs = CopyPersistentValue(self.activeTransmogSourceIDs) or {},
+		activeTransmogAppearanceQuestIDs = CopyPersistentValue(self.activeTransmogAppearanceQuestIDs) or {},
+		activeTransmogSourceQuestIDs = CopyPersistentValue(self.activeTransmogSourceQuestIDs) or {},
+		activeTasks = cachedTasks,
+	}
+
+	self:ScheduleNextCachedWorldQuestExpiry()
+end
+
+function WQA:LoadPersistentDisplayCache()
+	local cache = self.db.char.worldQuestDisplayCache
+	if type(cache) ~= "table" or cache.version ~= 1 or type(cache.activeTasks) ~= "table" then
+		self.activeTasks = self.activeTasks or {}
+		self.newTasks = {}
+		self:UpdateLDBText(next(self.activeTasks), nil)
+		self:Debug("No persistent display cache yet; open the world map once to seed it")
+		return false
+	end
+
+	self.questList = CopyPersistentValue(cache.questList) or {}
+	self.questPinList = CopyPersistentValue(cache.questPinList) or {}
+	self.questPinMapList = CopyPersistentValue(cache.questPinMapList) or {}
+	self.missionList = CopyPersistentValue(cache.missionList) or {}
+	self.questFlagList = CopyPersistentValue(cache.questFlagList) or {}
+	self.Criterias.AreaPoi.list = CopyPersistentValue(cache.areaPoiList) or {}
+	self.activeTransmogAppearanceIDs = CopyPersistentValue(cache.activeTransmogAppearanceIDs) or {}
+	self.activeTransmogSourceIDs = CopyPersistentValue(cache.activeTransmogSourceIDs) or {}
+	self.activeTransmogAppearanceQuestIDs = CopyPersistentValue(cache.activeTransmogAppearanceQuestIDs) or {}
+	self.activeTransmogSourceQuestIDs = CopyPersistentValue(cache.activeTransmogSourceQuestIDs) or {}
+	self.activeTasks = CopyPersistentValue(cache.activeTasks) or {}
+	self.newTasks = {}
+	self.pendingQuests = {}
+	self.rewards = true
+	self.emissaryRewards = true
+	local cachedFullScanAt = cache.fullScanCompletedAt
+	if type(cachedFullScanAt) ~= "number" and type(cache.lastFullScanAt) == "number" then
+		-- One-time compatibility with the first cache-maintenance test build.
+		cachedFullScanAt = cache.lastFullScanAt
+	end
+
+	if type(cachedFullScanAt) == "number" then
+		self.worldQuestFullScanCompletedAt = cachedFullScanAt
+	else
+		self.worldQuestFullScanCompletedAt = nil
+	end
+
+	-- Remove anything that expired while the character was offline before the
+	-- restored list is shown. This uses only cached absolute timestamps.
+	self:PruneExpiredCachedWorldQuests(true)
+
+	for _, task in ipairs(self.activeTasks) do
+		if task.type == "WORLD_QUEST" then
+			self.watched[task.id] = true
+		elseif task.type == "MISSION" then
+			self.watchedMissions[task.id] = true
+		elseif task.type == "AREA_POI" then
+			self.Criterias.AreaPoi.watched[task.id] = self.Criterias.AreaPoi.watched[task.id] or {}
+			self.Criterias.AreaPoi.watched[task.id][task.mapId] = true
+		end
+	end
+
+	self:UpdateLDBText(next(self.activeTasks), nil)
+	self:ScheduleNextCachedWorldQuestExpiry()
+	self:Debug("Loaded persistent WQ display cache", #self.activeTasks, "tasks")
+	return true
+end
+
+function WQA:InitializeDeferredDataSources()
+	if self.deferredDataSourcesInitialized then
+		return
+	end
+
+	self.deferredDataSourcesInitialized = true
+	self.quietStartupActive = false
+
+	-- GetPrimaryGarrisonFollowerType and some mission-table helpers live in the
+	-- Blizzard Garrison UI addon on some clients. If it is needed, load it only
+	-- while the World Map/taxi safe window is already active. Register the
+	-- mission event afterwards so its initialization burst cannot invoke WQAW.
+	if C_AddOns and C_AddOns.LoadAddOn then
+		pcall(C_AddOns.LoadAddOn, "Blizzard_GarrisonUI")
+	end
+	self.event:RegisterEvent("GARRISON_MISSION_LIST_UPDATE")
+
+	-- Collection events are intentionally deferred so the login-time
+	-- transmog collection population cannot make WQAW do background work.
+	self.event:RegisterEvent("TRANSMOG_COLLECTION_SOURCE_ADDED")
+	self.event:RegisterEvent("TRANSMOG_COLLECTION_UPDATED")
+	self.transmogListenersRegistered = true
+
+	self.event:RegisterEvent("EVENT_SCHEDULER_UPDATE")
+	self.event:RegisterEvent("SCENARIO_UPDATE")
+	self.event:RegisterEvent("SCENARIO_COMPLETED")
+
+	if C_EventScheduler and C_EventScheduler.RequestEvents then
+		C_EventScheduler.RequestEvents()
+		if not C_EventScheduler.HasData or C_EventScheduler.HasData() then
+			self:RefreshEventSchedulerCache()
+			self.eventSchedulerDirty = false
+		end
+	end
+
+	-- Periodic freshness starts only after WQAW has entered a deliberate safe
+	-- window once. A periodic tick can queue work, but cannot scan during normal
+	-- quest-giver interaction.
+	if not self.periodicRefreshScheduled then
+		self.periodicRefreshScheduled = true
+		self:ScheduleRepeatingTimer(function()
+			-- Mark the cached list as needing a future full refresh, but never
+			-- start cross-expansion quest API work automatically.
+			self.pendingSafeDiscoveryMode = self.pendingSafeDiscoveryMode or "new"
+		end, 30 * 60)
+	end
+
+	self:Debug("Deferred WQAW data sources initialized in safe window")
+end
+
+function WQA:TryStartSafeDiscovery()
+	-- Full cross-expansion discovery is manual-only. Merely opening the World
+	-- Map must never create quest API traffic that can delay an NPC interaction
+	-- after the map is closed.
+	if not self.fullRefreshExplicitlyRequested then
+		return false
+	end
+
+	if not self:IsSafeWorldQuestDiscoveryWindow() then
+		return false
+	end
+
+	self:InitializeDeferredDataSources()
+
+	-- Resume reward work that was deliberately stopped rather than polled while
+	-- the safe window was closed.
+	if self.rewardPreloadPausedForSafeWindow and self.rewardPreloadQueue and #self.rewardPreloadQueue > 0 then
+		self.rewardPreloadPausedForSafeWindow = false
+		self:StartRewardPreloadQueue(0.05)
+	end
+	if self.rewardPendingPausedForSafeWindow and self.pendingQuests and next(self.pendingQuests) then
+		self.rewardPendingPausedForSafeWindow = false
+		self:SchedulePendingRewardCheck(0.10)
+	end
+
+	-- Resume an interrupted safe-window discovery immediately when the map is
+	-- reopened instead of waiting for the old half-second pause timer.
+	if self.rewardScanInProgress then
+		self.rewardScanPausedForSafeWindow = false
+		if self.rewardScanTimer then
+			self:CancelTimer(self.rewardScanTimer)
+			self.rewardScanTimer = nil
+		end
+		self:ScheduleRewardScanStep(0.01)
+		return true
+	end
+
+	if self.backgroundScanInProgress then
+		self:ScheduleTimer(function()
+			self:TryStartSafeDiscovery()
+		end, 0.25)
+		return false
+	end
+
+	-- Opening the world map by itself must not start a cross-expansion scan.
+	-- Only login/periodic/game-setting events queue a refresh request.
+	local mode = self.pendingSafeDiscoveryMode
+	if not mode then
+		return false
+	end
+
+	self.pendingSafeDiscoveryMode = nil
+	self:Show(mode, true)
+	return true
+end
+
+function WQA:WithCommittedScanState(callback)
+	if type(callback) ~= "function" then
+		return
+	end
+
+	if self.backgroundScanInProgress and self.backgroundScanCommittedState then
+		local buildState = self:CaptureQuestRefreshState()
+		self:ApplyQuestRefreshState(self.backgroundScanCommittedState)
+
+		local ok, err = pcall(callback)
+
+		self:ApplyQuestRefreshState(buildState)
+
+		if not ok then
+			error(err)
+		end
+		return
+	end
+
+	callback()
+end
+
+function WQA:FinishBackgroundScan(mode)
+	if not self.backgroundScanInProgress then
+		return
+	end
+
+	local completedExplicitFullRefresh = self.fullRefreshExplicitlyRequested == true
+
+	self.backgroundScanInProgress = false
+	self.backgroundScanCommittedState = nil
+	self.backgroundScanMode = nil
+
+	-- One explicit /wqaw refresh authorizes one complete cross-expansion scan.
+	-- After it commits, opening M goes back to being completely passive.
+	self.fullRefreshExplicitlyRequested = false
+
+	if completedExplicitFullRefresh then
+		local now = GetServerTime and GetServerTime() or time()
+		self.worldQuestFullScanCompletedAt = now
+
+		-- CheckWQ saved the completed quest snapshot immediately before this
+		-- function. Save once more so the authoritative full-scan timestamp is
+		-- persisted with that same snapshot.
+		self:SavePersistentDisplayCache()
+	end
+
+	self:RefreshVisibleTaskList()
+
+	local queuedMode = self.backgroundScanQueuedMode
+	self.backgroundScanQueuedMode = nil
+
+	if queuedMode then
+		self:ScheduleTimer(function()
+			if queuedMode == "all" then
+				self:Show(nil, true)
+			else
+				self:Show(queuedMode, true)
+			end
+		end, 0.5)
+	end
 end
 
 function WQA:EnterSilentBuildState()
@@ -736,37 +1160,269 @@ function WQA:ExitSilentBuildState(enteredBuildState, commit)
 	end
 end
 
-WQA.first = false
-function WQA:Show(mode, auto)
-	-- The minimap hover and the clicked popup must always start from the same
-	-- committed task snapshot. Previously hover rendered activeTasks directly,
-	-- while popup mode performed a fresh full scan first; that allowed the two
-	-- views to show different quest sets.
-	--
-	-- Open the popup immediately from activeTasks, then request a silent
-	-- double-buffered refresh on the next moment. If the refresh finds changes,
-	-- the already-open popup is updated in place when the new state is complete.
-	if mode == "popup" then
-		self.popupRequestActive = true
-		self:AnnouncePopUp(self.activeTasks or {})
+local function RemoveWorldQuestFromTaskList(tasks, questID)
+	if type(tasks) ~= "table" then
+		return false
+	end
 
-		if not self.silentRefreshInProgress then
-			if self.popupRefreshTimer then
-				self:CancelTimer(self.popupRefreshTimer)
+	local removed = false
+
+	for index = #tasks, 1, -1 do
+		local task = tasks[index]
+		if task and task.type == "WORLD_QUEST" and task.id == questID then
+			table.remove(tasks, index)
+			removed = true
+		end
+	end
+
+	return removed
+end
+
+function WQA:GetLastFullScanStatusText()
+	local lastScan = self.worldQuestFullScanCompletedAt
+
+	if type(lastScan) ~= "number" then
+		local cache = self.db.char.worldQuestDisplayCache
+		if type(cache) == "table" then
+			if type(cache.fullScanCompletedAt) == "number" then
+				lastScan = cache.fullScanCompletedAt
+			elseif type(cache.lastFullScanAt) == "number" then
+				-- Compatibility with a valid numeric value written by the first
+				-- cache-maintenance test build. Table values are deliberately ignored.
+				lastScan = cache.lastFullScanAt
 			end
+		end
+	end
 
-			self.popupRefreshTimer = self:ScheduleTimer(function()
-				self.popupRefreshTimer = nil
+	if type(lastScan) ~= "number" then
+		return "Last full scan: not recorded"
+	end
 
-				-- A targeted transmog/event refresh may have started in the short
-				-- interval after the popup opened. Let that existing transaction
-				-- update the popup rather than queueing a redundant second scan.
-				if not self.silentRefreshInProgress then
-					self:Show("silent", true)
-				end
-			end, 0.1)
+	local now = GetServerTime and GetServerTime() or time()
+	local age = math.max(0, now - lastScan)
+
+	if age < 60 then
+		return "Last full scan: just now"
+	end
+
+	local minutes = math.floor(age / 60)
+	if minutes < 60 then
+		return string.format("Last full scan: %dm ago", minutes)
+	end
+
+	local hours = math.floor(minutes / 60)
+	local remainderMinutes = minutes % 60
+	if hours < 24 then
+		if remainderMinutes > 0 then
+			return string.format("Last full scan: %dh %dm ago", hours, remainderMinutes)
+		end
+		return string.format("Last full scan: %dh ago", hours)
+	end
+
+	local days = math.floor(hours / 24)
+	local remainderHours = hours % 24
+	if remainderHours > 0 then
+		return string.format("Last full scan: %dd %dh ago", days, remainderHours)
+	end
+	return string.format("Last full scan: %dd ago", days)
+end
+
+function WQA:ScheduleNextCachedWorldQuestExpiry()
+	if self.cachedWorldQuestExpiryTimer then
+		self:CancelTimer(self.cachedWorldQuestExpiryTimer)
+		self.cachedWorldQuestExpiryTimer = nil
+	end
+
+	local tasks = self.activeTasks
+	if self.backgroundScanInProgress
+		and self.backgroundScanCommittedState
+		and self.backgroundScanCommittedState.activeTasks
+	then
+		tasks = self.backgroundScanCommittedState.activeTasks
+	end
+
+	if type(tasks) ~= "table" then
+		return
+	end
+
+	local now = GetServerTime and GetServerTime() or time()
+	local earliest
+
+	for _, task in ipairs(tasks) do
+		if task.type == "WORLD_QUEST"
+			and type(task.expiresAt) == "number"
+			and task.expiresAt > now
+			and (not earliest or task.expiresAt < earliest)
+		then
+			earliest = task.expiresAt
+		end
+	end
+
+	if not earliest then
+		return
+	end
+
+	local delay = math.max(1, earliest - now + 1)
+	self.cachedWorldQuestExpiryTimer = self:ScheduleTimer(function()
+		self.cachedWorldQuestExpiryTimer = nil
+		self:PruneExpiredCachedWorldQuests(false)
+		self:ScheduleNextCachedWorldQuestExpiry()
+	end, delay)
+end
+
+function WQA:PruneExpiredCachedWorldQuests(suppressVisibleRefresh)
+	local now = GetServerTime and GetServerTime() or time()
+	local removedQuestIDs = {}
+
+	self:WithCommittedScanState(function()
+		for index = #(self.activeTasks or {}), 1, -1 do
+			local task = self.activeTasks[index]
+			if task
+				and task.type == "WORLD_QUEST"
+				and type(task.expiresAt) == "number"
+				and task.expiresAt <= now
+			then
+				removedQuestIDs[task.id] = true
+				table.remove(self.activeTasks, index)
+			end
 		end
 
+		for questID in pairs(removedQuestIDs) do
+			RemoveWorldQuestFromTaskList(self.newTasks, questID)
+
+			if self.questList then
+				self.questList[questID] = nil
+			end
+			if self.questPinList then
+				self.questPinList[questID] = nil
+			end
+			if self.questFlagList then
+				self.questFlagList[questID] = nil
+			end
+
+			self:RemoveQuestFromTransmogTracking(questID)
+		end
+
+		if next(removedQuestIDs) then
+			self.activeTasks = self:SortQuestList(self.activeTasks or {})
+			self.newTasks = self:SortQuestList(self.newTasks or {})
+			self:UpdateLDBText(next(self.activeTasks), next(self.newTasks))
+			self:SavePersistentDisplayCache()
+		end
+	end)
+
+	local removedCount = 0
+	for _ in pairs(removedQuestIDs) do
+		removedCount = removedCount + 1
+	end
+
+	if removedCount > 0 then
+		self:Debug("Pruned expired cached world quests", removedCount)
+		if not suppressVisibleRefresh then
+			self:RefreshVisibleTaskList()
+		end
+	end
+
+	return removedCount
+end
+
+function WQA:ResizeOpenPopupToTooltip()
+	if not self.tooltip or not self.PopUp or not self.PopUp.shown then
+		return
+	end
+
+	local PopUp = self.PopUp
+	PopUp:SetWidth(self.tooltip:GetWidth() + 8.5)
+	PopUp:SetHeight(self.tooltip:GetHeight() + 32)
+	PopUp:SetScale(self.tooltip:GetScale())
+
+	if PopUp:GetEffectiveScale() ~= self.tooltip:GetEffectiveScale() then
+		PopUp:SetScale(
+			PopUp:GetScale()
+				* self.tooltip:GetEffectiveScale()
+				/ PopUp:GetEffectiveScale()
+		)
+	end
+
+	PopUp:SetFrameLevel(self.tooltip:GetFrameLevel())
+end
+
+function WQA:RefreshVisibleTaskList()
+	if not self.tooltip then
+		return
+	end
+
+	self:WithCommittedScanState(function()
+		self:UpdateQTip(self.activeTasks or {})
+		self:ResizeOpenPopupToTooltip()
+	end)
+end
+
+function WQA:HandleQuestTurnedIn(questID)
+	self.db.global.completed[questID] = true
+
+	-- Once Blizzard marks a world quest complete, C_TaskQuest can stop
+	-- returning its zone/map immediately. If the old cached task remains
+	-- visible until the later transmog refresh, the tooltip can therefore
+	-- temporarily sort it under "Unknown".
+	--
+	-- Remove the completed quest from every committed snapshot immediately.
+	local removed = RemoveWorldQuestFromTaskList(self.activeTasks, questID)
+	RemoveWorldQuestFromTaskList(self.newTasks, questID)
+
+	if self.silentCommittedState then
+		RemoveWorldQuestFromTaskList(self.silentCommittedState.activeTasks, questID)
+		RemoveWorldQuestFromTaskList(self.silentCommittedState.newTasks, questID)
+	end
+
+	if self.silentBuildState then
+		RemoveWorldQuestFromTaskList(self.silentBuildState.activeTasks, questID)
+		RemoveWorldQuestFromTaskList(self.silentBuildState.newTasks, questID)
+	end
+
+	if self.backgroundScanCommittedState then
+		if RemoveWorldQuestFromTaskList(self.backgroundScanCommittedState.activeTasks, questID) then
+			removed = true
+		end
+		RemoveWorldQuestFromTaskList(self.backgroundScanCommittedState.newTasks, questID)
+	end
+
+	if removed then
+		self:Debug("Removing completed world quest from committed list", questID)
+		self:UpdateLDBText(
+			self.activeTasks and next(self.activeTasks) or nil,
+			self.newTasks and next(self.newTasks) or nil
+		)
+		self:RefreshVisibleTaskList()
+		self:SavePersistentDisplayCache()
+	end
+end
+
+WQA.first = false
+function WQA:Show(mode, auto)
+	-- Hover and left-click both use the same last fully committed activeTasks
+	-- snapshot. Opening the popup is a UI action, not a reason to perform a
+	-- fresh full quest/reward scan.
+	if mode == "popup" then
+		self:PruneExpiredCachedWorldQuests(false)
+		self.popupRequestActive = true
+		self:WithCommittedScanState(function()
+			self:AnnouncePopUp(self.activeTasks or {})
+		end)
+		return
+	end
+
+	-- A full world-quest discovery scan is never allowed during ordinary play.
+	-- Queue it until the world map is open or the player is on a taxi.
+	if not self:IsSafeWorldQuestDiscoveryWindow() then
+		self.pendingSafeDiscoveryMode = mode or "new"
+		self:Debug("Deferring full WQ discovery until safe window", tostring(self.pendingSafeDiscoveryMode))
+		return
+	end
+
+	if self.backgroundScanInProgress then
+		self.backgroundScanQueuedMode = mode or "all"
+		self:Debug("Full scan already in progress - queueing", tostring(self.backgroundScanQueuedMode))
 		return
 	end
 
@@ -788,6 +1444,13 @@ function WQA:Show(mode, auto)
 	if mode == "popup" then
 		self.popupRequestActive = true
 	end
+
+	-- Keep the last complete quest snapshot available to the minimap UI while
+	-- the new discovery scan is built cooperatively in the background.
+	self.backgroundScanCommittedState = self:CaptureQuestRefreshState()
+	self.backgroundScanInProgress = true
+	self.backgroundScanMode = mode or "all"
+	self.rewardContinuationMode = self.backgroundScanMode
 
 	-- A silent transmog refresh may need to wait for reward/item data after
 	-- CreateQuestList() returns. Keep its mode available to those asynchronous
@@ -852,6 +1515,15 @@ function WQA:CheckWQ(mode)
 		self.lastMode = mode
 	end
 	self:Debug("CheckWQ")
+
+	-- World-quest discovery is now cooperative/asynchronous. Keep the last
+	-- committed list visible until every enabled map has been inspected.
+	if self.rewardScanInProgress then
+		self:Debug("Reward discovery still in progress - keeping committed list")
+		self:ExitSilentBuildState(enteredSilentBuildState, false)
+		return
+	end
+
 
 	-- Silent transmog refreshes are transactional. CreateQuestList() rebuilds
 	-- questList/missionList immediately, while reward data can arrive over
@@ -1019,32 +1691,9 @@ function WQA:CheckWQ(mode)
 	self.newTasks = self:SortQuestList(self.newTasks)
 
 	if mode == "silent" then
-		-- No chat announcement and no new popup. If a minimap tooltip or clicked
-		-- popup is already visible, update that same view in place from the newly
-		-- completed committed task list.
-		if self.tooltip then
-			self:UpdateQTip(self.activeTasks)
-
-			-- AnnouncePopUp normally sizes the outer frame after UpdateQTip().
-			-- A silent refresh can change the number/width of rows while the popup
-			-- is already open, so keep its frame synchronized as well.
-			if self.PopUp and self.PopUp.shown then
-				local PopUp = self.PopUp
-				PopUp:SetWidth(self.tooltip:GetWidth() + 8.5)
-				PopUp:SetHeight(self.tooltip:GetHeight() + 32)
-				PopUp:SetScale(self.tooltip:GetScale())
-
-				if PopUp:GetEffectiveScale() ~= self.tooltip:GetEffectiveScale() then
-					PopUp:SetScale(
-						PopUp:GetScale()
-							* self.tooltip:GetEffectiveScale()
-							/ PopUp:GetEffectiveScale()
-					)
-				end
-
-				PopUp:SetFrameLevel(self.tooltip:GetFrameLevel())
-			end
-		end
+		-- No chat announcement and no new popup. Update whichever committed
+		-- tooltip/popup is currently visible only after the silent build is ready.
+		self:RefreshVisibleTaskList()
 	elseif mode == "new" then
 		self:AnnounceChat(self.newTasks, self.first)
 		if self.db.profile.options.PopUp == true then
@@ -1064,6 +1713,7 @@ function WQA:CheckWQ(mode)
 	end
 
 	self:UpdateLDBText(next(self.activeTasks), next(self.newTasks))
+	self:SavePersistentDisplayCache()
 
 	-- Reaching this point means the silent transaction produced a complete,
 	-- internally consistent list. Commit it once and release silent mode.
@@ -1083,8 +1733,13 @@ function WQA:CheckWQ(mode)
 		end
 	end
 
-	-- If this call temporarily switched to the background build state, publish
-	-- it only when complete; otherwise restore the last committed UI state.
+	if self.backgroundScanInProgress then
+		self:FinishBackgroundScan(mode)
+	end
+
+	-- If this call temporarily switched to the silent background build state,
+	-- publish it only when complete; otherwise restore the last committed UI
+	-- state.
 	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 end
 
@@ -1390,173 +2045,438 @@ local SkipRewardDataPreloadQuests = {
 	[95438] = true
 }
  
+local REWARD_PRELOAD_INTERVAL = 0.35
+local REWARD_PRELOAD_RETRY_COOLDOWN = 5
+local REWARD_INTERACTION_RETRY = 1
+
+-- Pace the full cross-expansion world-quest discovery pass as well. Querying
+-- every map and reward in one uninterrupted burst can interfere with Blizzard's
+-- normal quest-giver interaction.
+local REWARD_SCAN_MAP_INTERVAL = 0.03
+local REWARD_SCAN_QUEST_INTERVAL = 0.02
+local REWARD_SCAN_QUEST_BATCH_SIZE = 10
+local REWARD_SCAN_INTERACTION_RETRY = 0.25
+local REWARD_SCAN_SAFE_WINDOW_RETRY = 0.50
+
+function WQA:IsQuestInteractionActive()
+	if QuestFrame and QuestFrame.IsShown and QuestFrame:IsShown() then
+		return true
+	end
+	if GossipFrame and GossipFrame.IsShown and GossipFrame:IsShown() then
+		return true
+	end
+	if self:IsQuestLogDetailActive() then
+		return true
+	end
+	return false
+end
+
+function WQA:StopRewardPreloadQueue()
+	if self.rewardPreloadTimer then
+		self:CancelTimer(self.rewardPreloadTimer)
+		self.rewardPreloadTimer = nil
+	end
+	self.rewardPreloadQueue = {}
+	self.rewardPreloadQueued = {}
+end
+
+function WQA:ResetRewardPreloadQueue()
+	self:StopRewardPreloadQueue()
+	if self.rewardPendingPollTimer then
+		self:CancelTimer(self.rewardPendingPollTimer)
+		self.rewardPendingPollTimer = nil
+	end
+	self.rewardPreloadLastRequest = self.rewardPreloadLastRequest or {}
+	self.rewardPreloadRequestsThisScan = 0
+	self.rewardPreloadPausedForQuestUI = false
+end
+
+function WQA:SchedulePendingRewardCheck(delay)
+	if self.rewardPendingPollTimer then
+		return
+	end
+	self.rewardPendingPollTimer = self:ScheduleTimer(function()
+		self.rewardPendingPollTimer = nil
+		self:ProcessPendingRewards()
+	end, delay or 1)
+end
+
+function WQA:StartRewardPreloadQueue(delay)
+	if self.rewardPreloadTimer then
+		return
+	end
+	if not self.rewardPreloadQueue or #self.rewardPreloadQueue == 0 then
+		return
+	end
+	self.rewardPreloadTimer = self:ScheduleTimer(function()
+		self.rewardPreloadTimer = nil
+		self:ProcessRewardPreloadQueue()
+	end, delay or 0.1)
+end
+
+function WQA:QueueRewardPreload(questID)
+	if not questID or SkipRewardDataPreloadQuests[questID] then
+		return
+	end
+	if not HaveQuestData(questID) or HaveQuestRewardData(questID) then
+		return
+	end
+	self.rewardPreloadQueue = self.rewardPreloadQueue or {}
+	self.rewardPreloadQueued = self.rewardPreloadQueued or {}
+	self.rewardPreloadLastRequest = self.rewardPreloadLastRequest or {}
+	if self.rewardPreloadQueued[questID] then
+		return
+	end
+	local now = GetTime and GetTime() or 0
+	local lastRequest = self.rewardPreloadLastRequest[questID]
+	if lastRequest and now - lastRequest < REWARD_PRELOAD_RETRY_COOLDOWN then
+		return
+	end
+	self.rewardPreloadQueued[questID] = true
+	table.insert(self.rewardPreloadQueue, questID)
+	self:StartRewardPreloadQueue()
+end
+
+function WQA:ProcessRewardPreloadQueue()
+	if not self.rewardPreloadQueue or #self.rewardPreloadQueue == 0 then
+		return
+	end
+	if not self:IsSafeWorldQuestDiscoveryWindow() then
+		-- Do not poll every 0.5s during normal gameplay. WorldMapOnShow will
+		-- resume this queue the next time a safe refresh window opens.
+		self.rewardPreloadPausedForSafeWindow = true
+		return
+	end
+	self.rewardPreloadPausedForSafeWindow = false
+	if self:IsQuestInteractionActive() then
+		self.rewardPreloadPausedForQuestUI = true
+		self:StartRewardPreloadQueue(REWARD_INTERACTION_RETRY)
+		return
+	end
+	self.rewardPreloadPausedForQuestUI = false
+	local questID = table.remove(self.rewardPreloadQueue, 1)
+	if self.rewardPreloadQueued then
+		self.rewardPreloadQueued[questID] = nil
+	end
+	if HaveQuestData(questID)
+		and not HaveQuestRewardData(questID)
+		and not SkipRewardDataPreloadQuests[questID]
+	then
+		C_TaskQuest.RequestPreloadRewardData(questID)
+		self.rewardPreloadLastRequest = self.rewardPreloadLastRequest or {}
+		self.rewardPreloadLastRequest[questID] = GetTime and GetTime() or 0
+		self.rewardPreloadRequestsThisScan = (self.rewardPreloadRequestsThisScan or 0) + 1
+		self:Debug("Reward preload request", questID, "queue remaining=" .. tostring(#self.rewardPreloadQueue))
+	end
+	if #self.rewardPreloadQueue > 0 then
+		self:StartRewardPreloadQueue(REWARD_PRELOAD_INTERVAL)
+	end
+end
+ 
 -- Process only quests in the pending reward queue
 function WQA:ProcessPendingRewards()
+	if not self:IsSafeWorldQuestDiscoveryWindow() then
+		self.rewardPendingPausedForSafeWindow = true
+		return
+	end
+	self.rewardPendingPausedForSafeWindow = false
+	self.rewardPreloadPausedForSafeWindow = false
+	if self:IsQuestInteractionActive() then
+		self.rewardPreloadPausedForQuestUI = true
+		self:SchedulePendingRewardCheck(REWARD_INTERACTION_RETRY)
+		return
+	end
+
+	self.rewardPreloadPausedForQuestUI = false
+	if self.rewardPendingPollTimer then
+		self:CancelTimer(self.rewardPendingPollTimer)
+		self.rewardPendingPollTimer = nil
+	end
+
 	local enteredSilentBuildState = self:EnterSilentBuildState()
 	local retry = false
 	for questID, _ in pairs(self.pendingQuests or {}) do
 		local isEmissary = self.questList[questID] and self.questList[questID].isEmissary
- 
 		if HaveQuestData(questID) and HaveQuestRewardData(questID) then
 			local questNeedsRetry = self:CheckItems(questID, isEmissary)
 			self:CheckCurrencies(questID, isEmissary)
- 
 			if not questNeedsRetry then
-				self.pendingQuests[questID] = nil 
+				self.pendingQuests[questID] = nil
 			else
 				retry = true
 			end
 		else
-			if not SkipRewardDataPreloadQuests[questID] then
-				C_TaskQuest.RequestPreloadRewardData(questID)
-			end
+			self:QueueRewardPreload(questID)
 			retry = true
 		end
 	end
- 
+
 	if retry then
 		self.event:RegisterEvent("QUEST_LOG_UPDATE")
 		self.event:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+		self:StartRewardPreloadQueue()
+		self:SchedulePendingRewardCheck(1)
 	else
+		self:StopRewardPreloadQueue()
 		self.rewards = true
 		self.emissaryRewards = true
-		local callbackMode = self.pendingRefreshMode or self.lastMode
+		local callbackMode = self.pendingRefreshMode or self.backgroundScanMode or self.rewardContinuationMode or self.lastMode
 		if callbackMode then
 			self:CheckWQ(callbackMode)
 		end
 	end
 	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 end
- 
+
+function WQA:ProcessRewardQuest(mapID, questID)
+	local questTagInfo = GetQuestTagInfo(questID)
+	local worldQuestType = 0
+	if questTagInfo then
+		worldQuestType = questTagInfo.worldQuestType
+	end
+
+	if self.questList[questID] and not self.db.profile.options.reward.general.worldQuestType[worldQuestType] then
+		self.questList[questID] = nil
+	end
+
+	local questZoneID = C_TaskQuest.GetQuestZoneID(questID)
+	if
+		self.db.profile.options.zone[questZoneID] == true and
+		self.db.profile.options.reward.general.worldQuestType[worldQuestType]
+	then
+		if QuestUtils_IsQuestWorldQuest(questID) and not self.db.global.completed[questID] then
+			local exp = 0
+			for expansion, zones in pairs(WQA.ZoneIDList) do
+				for _, zoneID in pairs(zones) do
+					if questZoneID == zoneID then
+						exp = expansion
+					end
+				end
+			end
+
+			if
+				self.db.profile.achievements[11189] ~= "disabled" and not select(4, GetAchievementInfo(11189)) and exp == 7 and
+				mapID ~= 830 and
+				mapID ~= 885 and
+				mapID ~= 882
+			then
+				self:AddRewardToQuest(questID, "ACHIEVEMENT", 11189)
+			elseif
+				self.db.profile.achievements[13144] ~= "disabled" and not select(4, GetAchievementInfo(13144)) and exp == 8
+			then
+				self:AddRewardToQuest(questID, "ACHIEVEMENT", 13144)
+			elseif
+				self.db.profile.achievements[14758] ~= "disabled" and not select(4, GetAchievementInfo(14758)) and exp == 9
+			then
+				self:AddRewardToQuest(questID, "ACHIEVEMENT", 14758)
+			end
+		end
+
+		local questNeedsRetry = false
+		if not SkipRewardDataPreloadQuests[questID] and HaveQuestData(questID) and not HaveQuestRewardData(questID) then
+			self:QueueRewardPreload(questID)
+			questNeedsRetry = true
+		end
+
+		if self:CheckItems(questID) then
+			questNeedsRetry = true
+		end
+		self:CheckCurrencies(questID)
+
+		if questNeedsRetry then
+			self.rewardScanRetry = true
+			self.pendingQuests[questID] = true
+		end
+
+		local tradeskillLineID = questTagInfo and questTagInfo.tradeskillLineID
+		if tradeskillLineID then
+			local professionName = C_TradeSkillUI.GetTradeSkillDisplayName(tradeskillLineID)
+			local exp = 0
+			for expansion, zones in pairs(WQA.ZoneIDList) do
+				for _, zoneID in pairs(zones) do
+					if questZoneID == zoneID then
+						exp = expansion
+					end
+				end
+			end
+
+			if
+				exp > 0 and
+				self.db.char[exp] and
+				self.db.char[exp].profession and
+				self.db.char[exp].profession[tradeskillLineID] and
+				self.db.profile.options.reward[exp] and
+				self.db.profile.options.reward[exp].profession and
+				self.db.profile.options.reward[exp].profession[tradeskillLineID] and
+				not self.db.char[exp].profession[tradeskillLineID].isMaxLevel and
+				self.db.profile.options.reward[exp].profession[tradeskillLineID].skillup
+			then
+				self:AddRewardToQuest(questID, "PROFESSION_SKILLUP", professionName)
+			end
+		end
+	end
+end
+
+function WQA:ScheduleRewardScanStep(delay)
+	if self.rewardScanTimer then
+		return
+	end
+
+	self.rewardScanTimer = self:ScheduleTimer(function()
+		self.rewardScanTimer = nil
+		self:ProcessRewardScanStep()
+	end, delay or REWARD_SCAN_QUEST_INTERVAL)
+end
+
+function WQA:FinishRewardDiscoveryScan()
+	self.rewardScanInProgress = false
+	self.rewardScanCurrentQuests = nil
+	self.rewardScanCurrentMapID = nil
+	self.rewardScanQuestIndex = nil
+
+	if self.rewardScanRetry == true then
+		self:Debug("|cFFFF0000<<<SOME ITEMS PENDING - PACED QUEUE>>>|r")
+		self.event:RegisterEvent("QUEST_LOG_UPDATE")
+		self.event:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+		self:StartRewardPreloadQueue()
+		self:SchedulePendingRewardCheck(1)
+	else
+		self.rewards = true
+	end
+
+	-- Avoid overlapping the old emissary scan with map discovery. Suppress its
+	-- legacy immediate CheckWQ callback here so this finalizer publishes exactly
+	-- one snapshot.
+	self.rewardDiscoveryFinalizing = true
+	self:EmissaryReward()
+	self.rewardDiscoveryFinalizing = false
+
+	-- Normal scans can publish a coherent best-effort list now; missing reward
+	-- links continue loading through the paced queue. Silent transmog refreshes
+	-- remain atomic in CheckWQ until their pending reward data is complete.
+	self:CheckWQ(self.backgroundScanMode or self.pendingRefreshMode or self.rewardContinuationMode or self.lastMode)
+end
+
+function WQA:ProcessRewardScanStep()
+	if not self.rewardScanInProgress then
+		return
+	end
+
+	if not self:IsSafeWorldQuestDiscoveryWindow() then
+		-- Pause completely. Do not leave a half-second AceTimer polling loop
+		-- running while the player is using normal quest UI.
+		self.rewardScanPausedForSafeWindow = true
+		return
+	end
+	self.rewardScanPausedForSafeWindow = false
+
+	if self:IsQuestInteractionActive() then
+		self.rewardScanPausedForQuestUI = true
+		self:ScheduleRewardScanStep(REWARD_SCAN_INTERACTION_RETRY)
+		return
+	end
+	self.rewardScanPausedForQuestUI = false
+
+	local enteredSilentBuildState = self:EnterSilentBuildState()
+
+	-- Process a small batch of world quests, then yield back to Blizzard.
+	-- This is much faster than one quest per timer tick without returning to
+	-- the old uninterrupted scan that interfered with quest NPC interaction.
+	if self.rewardScanCurrentQuests then
+		local processedThisTick = 0
+
+		while processedThisTick < REWARD_SCAN_QUEST_BATCH_SIZE do
+			local quest = self.rewardScanCurrentQuests[self.rewardScanQuestIndex]
+			if not quest then
+				break
+			end
+
+			self:ProcessRewardQuest(self.rewardScanCurrentMapID, quest.questID)
+			self.rewardScanQuestIndex = self.rewardScanQuestIndex + 1
+			self.rewardScanQuestsProcessed = (self.rewardScanQuestsProcessed or 0) + 1
+			processedThisTick = processedThisTick + 1
+		end
+
+		if self.rewardScanCurrentQuests[self.rewardScanQuestIndex] then
+			self:ExitSilentBuildState(enteredSilentBuildState, false)
+			self:ScheduleRewardScanStep(REWARD_SCAN_QUEST_INTERVAL)
+			return
+		end
+
+		self.rewardScanCurrentQuests = nil
+		self.rewardScanCurrentMapID = nil
+		self.rewardScanQuestIndex = nil
+	end
+
+	-- Query one map per short tick while the world map/taxi safe window is open.
+	-- Because quest-giver interaction is impossible in that window, discovery can
+	-- be aggressive without blocking normal/daily quest acceptance.
+	local mapID = self.rewardScanMaps and self.rewardScanMaps[self.rewardScanMapIndex]
+	if mapID then
+		self.rewardScanMapIndex = self.rewardScanMapIndex + 1
+		self.rewardScanMapsProcessed = (self.rewardScanMapsProcessed or 0) + 1
+		self.rewardScanCurrentMapID = mapID
+		self.rewardScanCurrentQuests = C_TaskQuest.GetQuestsOnMap(mapID) or {}
+		self.rewardScanQuestIndex = 1
+
+		self:ExitSilentBuildState(enteredSilentBuildState, false)
+
+		if #self.rewardScanCurrentQuests > 0 then
+			self:ScheduleRewardScanStep(REWARD_SCAN_QUEST_INTERVAL)
+		else
+			self:ScheduleRewardScanStep(REWARD_SCAN_MAP_INTERVAL)
+		end
+		return
+	end
+
+	self:FinishRewardDiscoveryScan()
+	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
+end
+
 function WQA:Reward()
-	self:Debug("Reward")
- 
+	self:Debug("Reward - starting cooperative discovery scan")
+
 	self.event:UnregisterEvent("QUEST_LOG_UPDATE")
 	self.event:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
+	self:ResetRewardPreloadQueue()
 	self.rewards = false
-	local retry = false
- 
-	-- Azerite Traits
+
+	if self.rewardScanTimer then
+		self:CancelTimer(self.rewardScanTimer)
+		self.rewardScanTimer = nil
+	end
+
 	if self.db.profile.options.reward.gear.azeriteTraits ~= "" then
 		self.azeriteTraitsList = {}
 		for spellID in string.gmatch(self.db.profile.options.reward.gear.azeriteTraits, "(%d+)") do
 			self.azeriteTraitsList[tonumber(spellID)] = true
 		end
 	end
- 
-	for i in pairs(self.ZoneIDList) do
-		for _, mapID in pairs(self.ZoneIDList[i]) do
+
+	self.rewardScanMaps = {}
+	for expansionID in pairs(self.ZoneIDList) do
+		for _, mapID in pairs(self.ZoneIDList[expansionID]) do
 			if self.db.profile.options.zone[mapID] == true then
-				local quests = C_TaskQuest.GetQuestsOnMap(mapID)
-				if quests then
-					for j = 1, #quests do
-						local questID = quests[j].questID
-						local questTagInfo = GetQuestTagInfo(questID)
-						local worldQuestType = 0
-						if questTagInfo then
-							worldQuestType = questTagInfo.worldQuestType
-						end
- 
-						if self.questList[questID] and not self.db.profile.options.reward.general.worldQuestType[worldQuestType] then
-							self.questList[questID] = nil
-						end
- 
-						if
-							self.db.profile.options.zone[C_TaskQuest.GetQuestZoneID(questID)] == true and
-							self.db.profile.options.reward.general.worldQuestType[worldQuestType]
-						then
-							-- 100 different World Quests achievements
-							if QuestUtils_IsQuestWorldQuest(questID) and not self.db.global.completed[questID] then
-								local zoneID = C_TaskQuest.GetQuestZoneID(questID)
-								local exp = 0
-								for expansion, zones in pairs(WQA.ZoneIDList) do
-									for _, v in pairs(zones) do
-										if zoneID == v then
-											exp = expansion
-										end
-									end
-								end
- 
-								if
-									self.db.profile.achievements[11189] ~= "disabled" and not select(4, GetAchievementInfo(11189)) and exp == 7 and
-									mapID ~= 830 and
-									mapID ~= 885 and
-									mapID ~= 882
-								then
-									self:AddRewardToQuest(questID, "ACHIEVEMENT", 11189)
-								elseif
-									self.db.profile.achievements[13144] ~= "disabled" and not select(4, GetAchievementInfo(13144)) and exp == 8
-								then
-									self:AddRewardToQuest(questID, "ACHIEVEMENT", 13144)
-								elseif
-									self.db.profile.achievements[14758] ~= "disabled" and not select(4, GetAchievementInfo(14758)) and exp == 9
-								then
-									self:AddRewardToQuest(questID, "ACHIEVEMENT", 14758)
-								end
-							end
- 
-							-- Identify specific quests needing a reward retry
-							local questNeedsRetry = false
-							if not SkipRewardDataPreloadQuests[questID] and HaveQuestData(questID) and not HaveQuestRewardData(questID) then
-								C_TaskQuest.RequestPreloadRewardData(questID)
-								questNeedsRetry = true
-							end
-							if self:CheckItems(questID) then
-								questNeedsRetry = true
-							end
-							self:CheckCurrencies(questID)
- 
-							if questNeedsRetry then
-								retry = true
-								self.pendingQuests[questID] = true
-							end
- 
-							-- Profession
-							local tradeskillLineID
-							if questTagInfo then
-								tradeskillLineID = GetQuestTagInfo(questID).tradeskillLineID
-							end
- 
-							if tradeskillLineID then
-								local professionName = C_TradeSkillUI.GetTradeSkillDisplayName(tradeskillLineID)
-								local zoneID = C_TaskQuest.GetQuestZoneID(questID)
-								local exp = 0
-								for expansion, zones in pairs(WQA.ZoneIDList) do
-									for _, v in pairs(zones) do
-										if zoneID == v then
-											exp = expansion
-										end
-									end
-								end
- 
-								if
-									not self.db.char[exp].profession[tradeskillLineID].isMaxLevel and
-									self.db.profile.options.reward[exp].profession[tradeskillLineID].skillup
-								then
-									self:AddRewardToQuest(questID, "PROFESSION_SKILLUP", professionName)
-								end
-							end
-						end
-					end
-				end
+				table.insert(self.rewardScanMaps, mapID)
 			end
 		end
 	end
- 
-	-- Use passive event listening instead of a recursive retry loop
-	if retry == true then
-		self:Debug("|cFFFF0000<<<SOME ITEMS PENDING - QUEUING>>>|r")
-		self.event:RegisterEvent("QUEST_LOG_UPDATE")
-		self.event:RegisterEvent("GET_ITEM_INFO_RECEIVED")
-	else
-		self.rewards = true
-		local callbackMode = self.pendingRefreshMode or self.lastMode
-		if callbackMode then
-			self:CheckWQ(callbackMode)
-		end
-	end
+	table.sort(self.rewardScanMaps)
+
+	self.rewardScanMapIndex = 1
+	self.rewardScanCurrentMapID = nil
+	self.rewardScanCurrentQuests = nil
+	self.rewardScanQuestIndex = nil
+	self.rewardScanRetry = false
+	self.rewardScanInProgress = true
+	self.rewardScanMapsProcessed = 0
+	self.rewardScanQuestsProcessed = 0
+	self.rewardScanPausedForQuestUI = false
+
+	self:Debug("Reward discovery maps queued", #self.rewardScanMaps)
+	self:ScheduleRewardScanStep(0.1)
 end
- 
+
 local weaponCache = {
 	[165872] = true, -- 7th Legion Equipment Cache
 	[165867] = true, -- Kul Tiran Weapons Cache
@@ -1621,61 +2541,163 @@ function WQA:IsTransmogable(itemLink)
 	return true
 end
  
-function WQA:TrackActiveTransmogReward(itemLink, reason)
-	-- itemAppearanceID identifies the shared visual appearance.
-	-- itemModifiedAppearanceID identifies the exact transmog source.
+function WQA:EvaluateTransmogReward(itemLink)
+	local transmog
+	local reason
+	local searchForLinkResult = SearchAllTheThingsSafely(itemLink)
+	if searchForLinkResult and searchForLinkResult[1] then
+		local state = searchForLinkResult[1].collected
+		if not state then
+			transmog = "|TInterface\\Addons\\AllTheThings\\assets\\unknown:0|t"
+			reason = "appearance"
+		elseif state == 2 and self.db.profile.options.reward.gear.unknownSource then
+			transmog = "|TInterface\\Addons\\AllTheThings\\assets\\known_circle:0|t"
+			reason = "source"
+		end
+	end
+
+	if CanIMogIt and not transmog then
+		if CanIMogIt:IsEquippable(itemLink) and CanIMogIt:CharacterCanLearnTransmog(itemLink) then
+			if not CanIMogIt:PlayerKnowsTransmog(itemLink) then
+				transmog = "|TInterface\\AddOns\\CanIMogIt\\Icons\\UNKNOWN:0|t"
+				reason = "appearance"
+			elseif not CanIMogIt:PlayerKnowsTransmogFromItem(itemLink) and self.db.profile.options.reward.gear.unknownSource then
+				transmog = "|TInterface\\AddOns\\CanIMogIt\\Icons\\KNOWN_circle:0|t"
+				reason = "source"
+			end
+		end
+	end
+
+	return transmog, reason
+end
+
+function WQA:TrackActiveTransmogReward(questID, itemLink, reason)
 	local itemAppearanceID, itemModifiedAppearanceID = C_TransmogCollection.GetItemInfo(itemLink)
 
 	if reason == "appearance" and itemAppearanceID then
 		self.activeTransmogAppearanceIDs = self.activeTransmogAppearanceIDs or {}
+		self.activeTransmogAppearanceQuestIDs = self.activeTransmogAppearanceQuestIDs or {}
 		self.activeTransmogAppearanceIDs[itemAppearanceID] = true
+		self.activeTransmogAppearanceQuestIDs[itemAppearanceID] = self.activeTransmogAppearanceQuestIDs[itemAppearanceID] or {}
+		self.activeTransmogAppearanceQuestIDs[itemAppearanceID][questID] = true
 	end
 
 	if itemModifiedAppearanceID then
 		self.activeTransmogSourceIDs = self.activeTransmogSourceIDs or {}
+		self.activeTransmogSourceQuestIDs = self.activeTransmogSourceQuestIDs or {}
 		self.activeTransmogSourceIDs[itemModifiedAppearanceID] = true
+		self.activeTransmogSourceQuestIDs[itemModifiedAppearanceID] = self.activeTransmogSourceQuestIDs[itemModifiedAppearanceID] or {}
+		self.activeTransmogSourceQuestIDs[itemModifiedAppearanceID][questID] = true
 	end
+end
+
+function WQA:GetAppearanceIDForTransmogSource(itemModifiedAppearanceID)
+	if not itemModifiedAppearanceID then
+		return nil
+	end
+	if C_TransmogCollection.GetAppearanceSourceInfo then
+		local ok, info = pcall(C_TransmogCollection.GetAppearanceSourceInfo, itemModifiedAppearanceID)
+		if ok and info and info.itemAppearanceID then
+			return info.itemAppearanceID
+		end
+	end
+	if C_TransmogCollection.GetSourceInfo then
+		local ok, info = pcall(C_TransmogCollection.GetSourceInfo, itemModifiedAppearanceID)
+		if ok and info then
+			return info.visualID
+		end
+	end
+	return nil
+end
+
+local function MergeQuestIDSet(target, sourceSet)
+	if type(sourceSet) ~= "table" then
+		return target
+	end
+	target = target or {}
+	for questID in pairs(sourceSet) do
+		target[questID] = true
+	end
+	return target
+end
+
+function WQA:GetTrackedTransmogQuestIDsForSource(itemModifiedAppearanceID)
+	local quests = {}
+	quests = MergeQuestIDSet(quests, self.activeTransmogSourceQuestIDs and self.activeTransmogSourceQuestIDs[itemModifiedAppearanceID])
+	local appearanceID = self:GetAppearanceIDForTransmogSource(itemModifiedAppearanceID)
+	if appearanceID then
+		quests = MergeQuestIDSet(quests, self.activeTransmogAppearanceQuestIDs and self.activeTransmogAppearanceQuestIDs[appearanceID])
+	end
+	return quests
 end
 
 function WQA:IsTrackedTransmogSourceRelevant(itemModifiedAppearanceID)
-	if not itemModifiedAppearanceID then
-		return false
-	end
-
-	-- Exact source match is relevant for either unknown-appearance or
-	-- unknown-source tracking.
-	if self.activeTransmogSourceIDs
-		and self.activeTransmogSourceIDs[itemModifiedAppearanceID] == true
-	then
-		return true
-	end
-
-	-- A different source can teach the same appearance. Resolve the source
-	-- event to its appearance ID and compare it with the appearances represented
-	-- by currently relevant WQ rewards.
-	local itemAppearanceID
-
-	if C_TransmogCollection.GetAppearanceSourceInfo then
-		local ok, info = pcall(C_TransmogCollection.GetAppearanceSourceInfo, itemModifiedAppearanceID)
-		if ok and info then
-			itemAppearanceID = info.itemAppearanceID
-		end
-	end
-
-	-- Fallback for API states where the newer structured source-info function
-	-- is unavailable.
-	if not itemAppearanceID and C_TransmogCollection.GetSourceInfo then
-		local ok, info = pcall(C_TransmogCollection.GetSourceInfo, itemModifiedAppearanceID)
-		if ok and info then
-			itemAppearanceID = info.visualID
-		end
-	end
-
-	return itemAppearanceID
-		and self.activeTransmogAppearanceIDs
-		and self.activeTransmogAppearanceIDs[itemAppearanceID] == true
-		or false
+	return next(self:GetTrackedTransmogQuestIDsForSource(itemModifiedAppearanceID)) ~= nil
 end
+
+function WQA:RemoveQuestFromTransmogTracking(questID)
+	for appearanceID, questIDs in pairs(self.activeTransmogAppearanceQuestIDs or {}) do
+		questIDs[questID] = nil
+		if not next(questIDs) then
+			self.activeTransmogAppearanceQuestIDs[appearanceID] = nil
+			self.activeTransmogAppearanceIDs[appearanceID] = nil
+		end
+	end
+	for sourceID, questIDs in pairs(self.activeTransmogSourceQuestIDs or {}) do
+		questIDs[questID] = nil
+		if not next(questIDs) then
+			self.activeTransmogSourceQuestIDs[sourceID] = nil
+			self.activeTransmogSourceIDs[sourceID] = nil
+		end
+	end
+end
+
+function WQA:RefreshTrackedTransmogQuests(questIDs)
+	if type(questIDs) ~= "table" then
+		return
+	end
+
+	local changed = false
+	for questID in pairs(questIDs) do
+		local quest = self.questList and self.questList[questID]
+		local reward = quest and quest.reward
+		local item = reward and reward.item
+		if item and item.itemLink and item.transmog then
+			local newTransmog, newReason = self:EvaluateTransmogReward(item.itemLink)
+			self:RemoveQuestFromTransmogTracking(questID)
+
+			if newTransmog then
+				item.transmog = newTransmog
+				self:TrackActiveTransmogReward(questID, item.itemLink, newReason)
+			else
+				item.transmog = nil
+				local hasOtherItemReason = item.itemLevelUpgrade
+					or item.itemPercentUpgrade
+					or item.AzeriteArmorCache
+					or item.cache
+					or item._wqawOtherItemReason
+				if not hasOtherItemReason then
+					reward.item = nil
+				end
+
+				if not next(reward) then
+					self.questList[questID] = nil
+					RemoveWorldQuestFromTaskList(self.activeTasks, questID)
+					RemoveWorldQuestFromTaskList(self.newTasks, questID)
+				end
+			end
+			changed = true
+		end
+	end
+
+	if changed then
+		self.activeTasks = self:SortQuestList(self.activeTasks or {})
+		self:UpdateLDBText(next(self.activeTasks or {}), next(self.newTasks or {}))
+		self:RefreshVisibleTaskList()
+		self:SavePersistentDisplayCache()
+	end
+end
+
 
 function WQA:CheckItems(questID, isEmissary)
 	local numQuestRewards = GetNumQuestLogRewards(questID)
@@ -1998,39 +3020,11 @@ function WQA:CheckReward(questID, isEmissary, rewardIndex)
 		-- Transmog
 		if self.db.profile.options.reward.gear.unknownAppearance and self:IsTransmogable(itemLink) then
 			if itemClassID == 2 or itemClassID == 4 then
-				local transmog
-				local transmogReason
-				local searchForLinkResult = SearchAllTheThingsSafely(itemLink)
-				if searchForLinkResult and searchForLinkResult[1] then
-					local state = searchForLinkResult[1].collected
-					if not state then
-						transmog = "|TInterface\\Addons\\AllTheThings\\assets\\unknown:0|t"
-						transmogReason = "appearance"
-					elseif state == 2 and self.db.profile.options.reward.gear.unknownSource then
-						transmog = "|TInterface\\Addons\\AllTheThings\\assets\\known_circle:0|t"
-						transmogReason = "source"
-					end
-				end
-
-				if CanIMogIt and not transmog then
-					if CanIMogIt:IsEquippable(itemLink) and CanIMogIt:CharacterCanLearnTransmog(itemLink) then
-						if not CanIMogIt:PlayerKnowsTransmog(itemLink) then
-							transmog = "|TInterface\\AddOns\\CanIMogIt\\Icons\\UNKNOWN:0|t"
-							transmogReason = "appearance"
-						elseif not CanIMogIt:PlayerKnowsTransmogFromItem(itemLink) and self.db.profile.options.reward.gear.unknownSource then
-							transmog = "|TInterface\\AddOns\\CanIMogIt\\Icons\\KNOWN_circle:0|t"
-							transmogReason = "source"
-						end
-					end
-				end
+				local transmog, transmogReason = self:EvaluateTransmogReward(itemLink)
 				if transmog then
-					-- Only normal world-quest rewards participate in the targeted
-					-- collection refresh. Emissary/mission rewards keep their existing
-					-- behavior and cannot cause collection events to trigger a rescan.
 					if not isEmissary then
-						self:TrackActiveTransmogReward(itemLink, transmogReason)
+						self:TrackActiveTransmogReward(questID, itemLink, transmogReason)
 					end
-
 					local item = { itemLink = itemLink, transmog = transmog }
 					self:AddRewardToQuest(questID, "ITEM", item, isEmissary)
 				end
@@ -2062,7 +3056,7 @@ function WQA:CheckReward(questID, isEmissary, rewardIndex)
  
 		-- Items
 		if self.itemList[itemID] == true then
-			local item = { itemLink = itemLink }
+			local item = { itemLink = itemLink, _wqawOtherItemReason = true }
 			self:AddRewardToQuest(questID, "ITEM", item, isEmissary)
 		end
  
@@ -2076,7 +3070,7 @@ function WQA:CheckReward(questID, isEmissary, rewardIndex)
 					local spellID = C_AzeriteEmpoweredItem.GetPowerInfo(azeritePowerID).spellID
 					if self.azeriteTraitsList[spellID] then
 						self:AddRewardToQuest(questID, "AZERITE_TRAIT", spellID, isEmissary)
-						self:AddRewardToQuest(questID, "ITEM", { itemLink = itemLink }, isEmissary)
+						self:AddRewardToQuest(questID, "ITEM", { itemLink = itemLink, _wqawOtherItemReason = true }, isEmissary)
 					end
 				end
 			end
@@ -2084,7 +3078,7 @@ function WQA:CheckReward(questID, isEmissary, rewardIndex)
  
 		-- Conduit
 		if self.db.profile.options.reward.gear.conduit and C_Soulbinds.IsItemConduitByItemInfo(itemLink) then
-			self:AddRewardToQuest(questID, "ITEM", { itemLink = itemLink }, isEmissary)
+			self:AddRewardToQuest(questID, "ITEM", { itemLink = itemLink, _wqawOtherItemReason = true }, isEmissary)
 		end
 	else
 		retry = true
@@ -2333,6 +3327,7 @@ function WQA:EmissaryReward()
 				else
 					retry = true
 					self.pendingQuests[questID] = true
+					self:QueueRewardPreload(questID)
 				end
 			end
 		end
@@ -2342,12 +3337,17 @@ function WQA:EmissaryReward()
 		GetBountiesForMapIDRequested = true
 		self.event:RegisterEvent("QUEST_LOG_UPDATE")
 		self.event:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+		self:StartRewardPreloadQueue()
+		self:SchedulePendingRewardCheck(1)
 	else
 		GetBountiesForMapIDRequested = false
 		self.emissaryRewards = true
-		local callbackMode = self.pendingRefreshMode or self.lastMode
-		if callbackMode then
-			self:CheckWQ(callbackMode)
+
+		if not self.rewardDiscoveryFinalizing then
+			local callbackMode = self.pendingRefreshMode or self.backgroundScanMode or self.rewardContinuationMode or self.lastMode
+			if callbackMode then
+				self:CheckWQ(callbackMode)
+			end
 		end
 	end
 end
@@ -2401,6 +3401,7 @@ end
 local anchor
 function dataobj:OnEnter()
 	anchor = self
+	WQA:PruneExpiredCachedWorldQuests(false)
 	if not PopUpIsShown() then
 		-- Silent transmog refreshes are double-buffered: while the new scan is
 		-- resolving reward data, the last committed quest state remains live.
@@ -2411,7 +3412,9 @@ function dataobj:OnEnter()
 		-- behavior can freeze the client until all quest/reward data is rebuilt.
 		-- The normal login/periodic scans keep activeTasks up to date, so the
 		-- minimap tooltip should only render that cached result.
-		WQA:AnnounceLDB(WQA.activeTasks or {})
+		WQA:WithCommittedScanState(function()
+			WQA:AnnounceLDB(WQA.activeTasks or {})
+		end)
 	end
 end
  
@@ -2419,6 +3422,7 @@ function dataobj:OnClick(button)
 	if button == "LeftButton" then
 		WQA:Show("popup")
 	elseif button == "RightButton" then
+		WQA:EnsureOptionsRegistered()
 		Settings.OpenToCategory(WQA.optionsCategoryID or (WQA.optionsFrame and WQA.optionsFrame.name))
 	end
 end

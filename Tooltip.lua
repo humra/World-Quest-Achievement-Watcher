@@ -150,6 +150,9 @@ function WQA:UpdateQTip(tasks)
     tooltip:SetCell(1, tooltip:GetColumnCount(), _G.REWARDS)
     tooltip:AddSeparator()
 
+    tooltip:AddLine(string.format("|cffaaaaaa%s|r", self:GetLastFullScanStatusText()))
+    tooltip:AddSeparator()
+
     if next(tasks) == nil then
         tooltip:AddLine(L["NO_QUESTS"])
     else

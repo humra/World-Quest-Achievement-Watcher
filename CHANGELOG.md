@@ -1,7 +1,14 @@
 # World Quest Achievement Watcher Changelog
 
-## 1.0.6 - 2026-08-??
+## 1.1.0 - 2026-08-30
 
+Changed the way how and when WQAW quest list is updated.
+Unfortunately the only way to have it play nice with the game's interactions is by turning to manual mode of triggering a scan.
+From now on it is required to open the add-on interface by clicking the minimap icon or calling "/wqaw refresh" command in order to update the list.
+This change is made to fix the issues the add-on would cause when trying to talk to quest-giving NPCs, interacting with the quest log, or interacting with quest items.
+Improvements for this system will be made in future versions in order to minimize the required user input in refreshing the list.
+
+Minimap icon now displays the time since last full scan.
 After collecting a transmog appearance from a world quest a silent refresh will run a few seconds later in order to update the add-on's quest list.
 An issue where newly-appearing quests would not be grouped under the correct expansion section has been resolved.
 Fixed a synchronization issue where the minimap icon and the opened window would sometimes show different quest lists.

@@ -738,12 +738,35 @@ end
 
 WQA.first = false
 function WQA:Show(mode, auto)
-	-- The last committed quest state remains live while a silent transmog
-	-- refresh builds in the background, so popup clicks can stay responsive.
-	-- Show the committed list immediately instead of launching a second scan.
-	if mode == "popup" and self.silentRefreshInProgress then
+	-- The minimap hover and the clicked popup must always start from the same
+	-- committed task snapshot. Previously hover rendered activeTasks directly,
+	-- while popup mode performed a fresh full scan first; that allowed the two
+	-- views to show different quest sets.
+	--
+	-- Open the popup immediately from activeTasks, then request a silent
+	-- double-buffered refresh on the next moment. If the refresh finds changes,
+	-- the already-open popup is updated in place when the new state is complete.
+	if mode == "popup" then
 		self.popupRequestActive = true
 		self:AnnouncePopUp(self.activeTasks or {})
+
+		if not self.silentRefreshInProgress then
+			if self.popupRefreshTimer then
+				self:CancelTimer(self.popupRefreshTimer)
+			end
+
+			self.popupRefreshTimer = self:ScheduleTimer(function()
+				self.popupRefreshTimer = nil
+
+				-- A targeted transmog/event refresh may have started in the short
+				-- interval after the popup opened. Let that existing transaction
+				-- update the popup rather than queueing a redundant second scan.
+				if not self.silentRefreshInProgress then
+					self:Show("silent", true)
+				end
+			end, 0.1)
+		end
+
 		return
 	end
 
@@ -996,10 +1019,31 @@ function WQA:CheckWQ(mode)
 	self.newTasks = self:SortQuestList(self.newTasks)
 
 	if mode == "silent" then
-		-- No chat output and no popup. If the minimap tooltip is currently open,
-		-- update it in place so it immediately reflects the refreshed activeTasks.
+		-- No chat announcement and no new popup. If a minimap tooltip or clicked
+		-- popup is already visible, update that same view in place from the newly
+		-- completed committed task list.
 		if self.tooltip then
 			self:UpdateQTip(self.activeTasks)
+
+			-- AnnouncePopUp normally sizes the outer frame after UpdateQTip().
+			-- A silent refresh can change the number/width of rows while the popup
+			-- is already open, so keep its frame synchronized as well.
+			if self.PopUp and self.PopUp.shown then
+				local PopUp = self.PopUp
+				PopUp:SetWidth(self.tooltip:GetWidth() + 8.5)
+				PopUp:SetHeight(self.tooltip:GetHeight() + 32)
+				PopUp:SetScale(self.tooltip:GetScale())
+
+				if PopUp:GetEffectiveScale() ~= self.tooltip:GetEffectiveScale() then
+					PopUp:SetScale(
+						PopUp:GetScale()
+							* self.tooltip:GetEffectiveScale()
+							/ PopUp:GetEffectiveScale()
+					)
+				end
+
+				PopUp:SetFrameLevel(self.tooltip:GetFrameLevel())
+			end
 		end
 	elseif mode == "new" then
 		self:AnnounceChat(self.newTasks, self.first)

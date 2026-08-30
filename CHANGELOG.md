@@ -4,6 +4,7 @@
 
 After collecting a transmog appearance from a world quest a silent refresh will run a few seconds later in order to update the add-on's quest list.
 An issue where newly-appearing quests would not be grouped under the correct expansion section has been resolved.
+Fixed a synchronization issue where the minimap icon and the opened window would sometimes show different quest lists.
 
 ## 1.0.5 - 2026-08-29
 

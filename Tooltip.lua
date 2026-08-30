@@ -135,12 +135,27 @@ end
 
 function WQA:UpdateQTip(tasks)
     local tooltip = self.tooltip
+
+    -- UpdateQTip represents the complete current task list, not a delta.
+    -- Rebuild the visible rows on every update so a silent/background refresh
+    -- cannot append a second sorted batch underneath the previous contents.
+    -- This also removes quests that disappeared during the refresh.
+    ReleaseHoverTooltip()
+    tooltip:Clear()
+    tooltip.quests = {}
+    tooltip.missions = {}
+    tooltip.pois = {}
+
+    tooltip:AddHeader(_G.WORLD_QUEST_BANNER)
+    tooltip:SetCell(1, tooltip:GetColumnCount(), _G.REWARDS)
+    tooltip:AddSeparator()
+
     if next(tasks) == nil then
         tooltip:AddLine(L["NO_QUESTS"])
     else
-        tooltip.quests = tooltip.quests or {}
-        tooltip.missions = tooltip.missions or {}
-        tooltip.pois = tooltip.pois or {}
+        -- Sort defensively here as well. activeTasks is normally sorted before
+        -- display, but this keeps popup grouping correct for every caller.
+        tasks = self:SortQuestList(tasks)
 
         local i = tooltip:GetLineCount()
         local expansion, zoneID

@@ -296,10 +296,12 @@ function WQA:OnEnable()
 	self.event:RegisterEvent("EVENT_SCHEDULER_UPDATE")
 	self.event:RegisterEvent("SCENARIO_UPDATE")
 	self.event:RegisterEvent("SCENARIO_COMPLETED")
+	self.event:RegisterEvent("TRANSMOG_COLLECTION_SOURCE_ADDED")
+	self.event:RegisterEvent("TRANSMOG_COLLECTION_UPDATED")
 	self.event:SetScript(
 		"OnEvent",
 		function(...)
-			local _, name, id = ...
+			local _, name, id, arg2, arg3, arg4 = ...
 			if name == "PLAYER_ENTERING_WORLD" then
 				self:ScheduleTimer(
 					function()
@@ -345,7 +347,9 @@ function WQA:OnEnable()
 				end, 0.5)
 			elseif name == "PLAYER_REGEN_ENABLED" then
 				self.event:UnregisterEvent("PLAYER_REGEN_ENABLED")
-				self:Show("new", true)
+				local deferredMode = self.deferredShowMode or "new"
+				self.deferredShowMode = nil
+				self:Show(deferredMode, true)
 			elseif name == "QUEST_TURNED_IN" then
 				self.db.global.completed[id] = true
 			elseif name == "GARRISON_MISSION_LIST_UPDATE" then
@@ -362,6 +366,42 @@ function WQA:OnEnable()
 					self.eventSchedulerDebounceTimer = self:ScheduleTimer(function()
 						self:Show("new", true)
 					end, 0.5)
+				end
+			elseif name == "TRANSMOG_COLLECTION_SOURCE_ADDED" or name == "TRANSMOG_COLLECTION_UPDATED" then
+				-- Targeted transmog refresh:
+				-- only rescan when the learned appearance/source is currently relevant
+				-- to a transmog reward on an active world quest WQAW is tracking.
+				--
+				-- TRANSMOG_COLLECTION_SOURCE_ADDED:
+				--   id = itemModifiedAppearanceID (source ID)
+				--
+				-- TRANSMOG_COLLECTION_UPDATED:
+				--   id   = collectionIndex
+				--   arg2 = modID
+				--   arg3 = itemAppearanceID
+				--   arg4 = reason
+				if self.first and self.db.profile.options.reward.gear.unknownAppearance then
+					local relevant = false
+
+					if name == "TRANSMOG_COLLECTION_SOURCE_ADDED" then
+						relevant = self:IsTrackedTransmogSourceRelevant(id)
+					elseif name == "TRANSMOG_COLLECTION_UPDATED" and arg3 then
+						relevant = self.activeTransmogAppearanceIDs
+							and self.activeTransmogAppearanceIDs[arg3] == true
+					end
+
+					if relevant then
+						if self.transmogRefreshTimer then
+							self:CancelTimer(self.transmogRefreshTimer)
+						end
+
+						self:Debug("Relevant transmog collection changed - scheduling silent refresh")
+						self.transmogRefreshTimer = self:ScheduleTimer(function()
+							self.transmogRefreshTimer = nil
+							self:Debug("Refreshing after relevant transmog collection change")
+							self:Show("silent", true)
+						end, 3)
+					end
 				end
 			elseif name == "SCENARIO_UPDATE" or name == "SCENARIO_COMPLETED" then
 				-- Outdoor public events such as Cursed Surges can be visible
@@ -432,6 +472,11 @@ function WQA:CreateQuestList()
 		self:RefreshEventSchedulerCache()
 	end
 	self.questList = {}
+	-- Rebuilt on every full scan. These contain only transmog rewards currently
+	-- relevant to active world quests, so unrelated collection changes do not
+	-- trigger an expensive refresh.
+	self.activeTransmogAppearanceIDs = {}
+	self.activeTransmogSourceIDs = {}
 	self.questPinList = {}
 	self.questPinMapList = {}
 	self.missionList = {}
@@ -621,9 +666,97 @@ function WQA:AddEmissaryReward(questID, rewardType, reward)
 	self:AddRewardToQuest(questID, rewardType, reward, true)
 end
  
+function WQA:CaptureQuestRefreshState()
+	return {
+		questList = self.questList,
+		questPinList = self.questPinList,
+		questPinMapList = self.questPinMapList,
+		missionList = self.missionList,
+		questFlagList = self.questFlagList,
+		areaPoiList = self.Criterias.AreaPoi.list,
+		pendingQuests = self.pendingQuests,
+		rewards = self.rewards,
+		emissaryRewards = self.emissaryRewards,
+		activeTransmogAppearanceIDs = self.activeTransmogAppearanceIDs,
+		activeTransmogSourceIDs = self.activeTransmogSourceIDs,
+		activeTasks = self.activeTasks,
+		newTasks = self.newTasks,
+	}
+end
+
+function WQA:ApplyQuestRefreshState(state)
+	if not state then
+		return
+	end
+
+	self.questList = state.questList
+	self.questPinList = state.questPinList
+	self.questPinMapList = state.questPinMapList
+	self.missionList = state.missionList
+	self.questFlagList = state.questFlagList
+	self.Criterias.AreaPoi.list = state.areaPoiList
+	self.pendingQuests = state.pendingQuests
+	self.rewards = state.rewards
+	self.emissaryRewards = state.emissaryRewards
+	self.activeTransmogAppearanceIDs = state.activeTransmogAppearanceIDs
+	self.activeTransmogSourceIDs = state.activeTransmogSourceIDs
+	self.activeTasks = state.activeTasks
+	self.newTasks = state.newTasks
+end
+
+function WQA:EnterSilentBuildState()
+	if not self.silentRefreshInProgress
+		or self.silentBuildStateActive
+		or not self.silentBuildState
+	then
+		return false
+	end
+
+	self:ApplyQuestRefreshState(self.silentBuildState)
+	self.silentBuildStateActive = true
+	return true
+end
+
+function WQA:ExitSilentBuildState(enteredBuildState, commit)
+	if not enteredBuildState then
+		return
+	end
+
+	self.silentBuildState = self:CaptureQuestRefreshState()
+	self.silentBuildStateActive = false
+
+	if commit then
+		-- The build state is already live. It becomes the new committed state.
+		self.silentCommittedState = nil
+		self.silentBuildState = nil
+	else
+		-- Keep the last fully valid list available to the minimap icon while
+		-- asynchronous reward data continues loading in the background.
+		self:ApplyQuestRefreshState(self.silentCommittedState)
+	end
+end
+
 WQA.first = false
 function WQA:Show(mode, auto)
+	-- The last committed quest state remains live while a silent transmog
+	-- refresh builds in the background, so popup clicks can stay responsive.
+	-- Show the committed list immediately instead of launching a second scan.
+	if mode == "popup" and self.silentRefreshInProgress then
+		self.popupRequestActive = true
+		self:AnnouncePopUp(self.activeTasks or {})
+		return
+	end
+
+	-- If another relevant appearance is learned while this silent transaction
+	-- is still in flight, queue one additional pass rather than overlapping
+	-- two CreateQuestList() rebuilds.
+	if mode == "silent" and self.silentRefreshInProgress then
+		self.silentRefreshAgain = true
+		self:Debug("Silent refresh already in progress - queueing another pass")
+		return
+	end
 	if auto and self.db.profile.options.delayCombat == true and UnitAffectingCombat("player") then
+		self.deferredShowMode = mode
 		self.event:RegisterEvent("PLAYER_REGEN_ENABLED")
 		return
 	end
@@ -633,25 +766,93 @@ function WQA:Show(mode, auto)
 		self.popupRequestActive = true
 	end
 
+	-- A silent transmog refresh may need to wait for reward/item data after
+	-- CreateQuestList() returns. Keep its mode available to those asynchronous
+	-- callbacks without replacing lastMode, which is reserved for normal scans.
+	if mode == "silent" then
+		self.pendingRefreshMode = "silent"
+		self.silentRefreshInProgress = true
+		self.silentRefreshBuilding = true
+		self.silentCommittedState = self:CaptureQuestRefreshState()
+		self.silentBuildState = nil
+		self.silentBuildStateActive = true
+	else
+		-- A newer normal/manual refresh supersedes an unfinished silent refresh.
+		self.pendingRefreshMode = nil
+		self.silentRefreshInProgress = false
+		self.silentRefreshBuilding = false
+		self.silentRefreshAgain = nil
+		self.silentCommittedState = nil
+		self.silentBuildState = nil
+		self.silentBuildStateActive = false
+	end
+
 	self:CreateQuestList()
 
-	-- "popup" and "LDB" are transient UI requests. Do not remember them as
-	-- the mode that delayed reward/event processing should replay later.
-	if mode ~= "popup" and mode ~= "LDB" then
+	if mode == "silent" then
+		self.silentRefreshBuilding = false
+	end
+
+	-- "popup", "LDB", and "silent" are transient UI/maintenance requests. Do
+	-- not remember them as the mode delayed reward/event processing should use
+	-- for future normal scans.
+	if mode ~= "popup" and mode ~= "LDB" and mode ~= "silent" then
 		self.lastMode = mode
 	end
 
 	self:CheckWQ(mode)
+
+	if mode == "silent" and self.silentRefreshInProgress then
+		-- CheckWQ did not commit yet. Preserve the partially built state for
+		-- reward callbacks, then put the previous complete state back live so
+		-- minimap hover/click remains fully usable.
+		self.silentBuildState = self:CaptureQuestRefreshState()
+		self.silentBuildStateActive = false
+		self:ApplyQuestRefreshState(self.silentCommittedState)
+	elseif mode == "silent" then
+		-- The refresh completed synchronously and the new state is already live.
+		self.silentCommittedState = nil
+		self.silentBuildState = nil
+		self.silentBuildStateActive = false
+	end
+
 	self.first = true
 end
  
 function WQA:CheckWQ(mode)
-	-- Passive reward/event callbacks use lastMode. Never let a manual popup
-	-- or minimap-tooltip request become the mode they replay later.
-	if mode ~= "popup" and mode ~= "LDB" then
+	local enteredSilentBuildState = self:EnterSilentBuildState()
+
+	-- Passive reward/event callbacks use lastMode. Never let a manual popup,
+	-- minimap-tooltip request, or silent maintenance refresh become the mode
+	-- they replay later.
+	if mode ~= "popup" and mode ~= "LDB" and mode ~= "silent" then
 		self.lastMode = mode
 	end
 	self:Debug("CheckWQ")
+
+	-- Silent transmog refreshes are transactional. CreateQuestList() rebuilds
+	-- questList/missionList immediately, while reward data can arrive over
+	-- several asynchronous callbacks. Do not publish any of those intermediate
+	-- states to activeTasks or the tooltip.
+	if mode == "silent" and self.silentRefreshInProgress then
+		local hasPendingRewards = self.pendingQuests and next(self.pendingQuests) ~= nil
+
+		if self.silentRefreshBuilding
+			or self.rewards ~= true
+			or self.emissaryRewards ~= true
+			or hasPendingRewards
+		then
+			self:Debug(
+				"Silent refresh waiting for complete reward data",
+				"building=" .. tostring(self.silentRefreshBuilding),
+				"rewards=" .. tostring(self.rewards),
+				"emissary=" .. tostring(self.emissaryRewards),
+				"pending=" .. tostring(hasPendingRewards)
+			)
+			self:ExitSilentBuildState(enteredSilentBuildState, false)
+			return
+		end
+	end
  
 	-- Retail 12.1.0 can leave old item/reward data uncached indefinitely.
 	-- Do not block the entire quest scan while waiting for every reward link.
@@ -744,6 +945,7 @@ function WQA:CheckWQ(mode)
 		self:Debug("NoLink")
 		-- Gentle fallback just in case links are extremely stubborn
 		self:ScheduleTimer("CheckWQ", 1, mode)
+		self:ExitSilentBuildState(enteredSilentBuildState, false)
 		return
 	end
  
@@ -763,26 +965,43 @@ function WQA:CheckWQ(mode)
 	self.activeTasks = self:SortQuestList(self.activeTasks)
  
 	self.newTasks = {}
-	for id in pairs(newQuests) do
-		self.watched[id] = true
-		table.insert(self.newTasks, { id = id, type = "WORLD_QUEST" })
-	end
-	for id in pairs(newMissions) do
-		self.watchedMissions[id] = true
-		table.insert(self.newTasks, { id = id, type = "MISSION" })
-	end
-	for poiId, mapIds in pairs(pois.new) do
-		for mapId in pairs(mapIds) do
-			if not self.Criterias.AreaPoi.watched[poiId] then
-				self.Criterias.AreaPoi.watched[poiId] = {}
+
+	-- A silent maintenance refresh must update activeTasks without consuming
+	-- the "new" state. If a genuinely new quest appeared at the same time the
+	-- player learned a transmog, the next normal scan should still announce it.
+	if mode ~= "silent" then
+		for id in pairs(newQuests) do
+			self.watched[id] = true
+			table.insert(self.newTasks, { id = id, type = "WORLD_QUEST" })
+		end
+		for id in pairs(newMissions) do
+			self.watchedMissions[id] = true
+			table.insert(self.newTasks, { id = id, type = "MISSION" })
+		end
+		for poiId, mapIds in pairs(pois.new) do
+			for mapId in pairs(mapIds) do
+				if not self.Criterias.AreaPoi.watched[poiId] then
+					self.Criterias.AreaPoi.watched[poiId] = {}
+				end
+				self.Criterias.AreaPoi.watched[poiId][mapId] = true
+
+				table.insert(self.newTasks, { id = poiId, mapId = mapId, type = "AREA_POI" })
 			end
-			self.Criterias.AreaPoi.watched[poiId][mapId] = true
- 
-			table.insert(self.newTasks, { id = poiId, mapId = mapId, type = "AREA_POI" })
 		end
 	end
  
-	if mode == "new" then
+	-- activeTasks is already sorted above. newTasks is assembled from pairs(),
+	-- so sort it before any chat/popup rendering as well to keep expansion and
+	-- zone headers contiguous.
+	self.newTasks = self:SortQuestList(self.newTasks)
+
+	if mode == "silent" then
+		-- No chat output and no popup. If the minimap tooltip is currently open,
+		-- update it in place so it immediately reflects the refreshed activeTasks.
+		if self.tooltip then
+			self:UpdateQTip(self.activeTasks)
+		end
+	elseif mode == "new" then
 		self:AnnounceChat(self.newTasks, self.first)
 		if self.db.profile.options.PopUp == true then
 			self:AnnouncePopUp(self.newTasks, self.first)
@@ -799,10 +1018,32 @@ function WQA:CheckWQ(mode)
 			self:AnnouncePopUp(self.activeTasks)
 		end
 	end
- 
+
 	self:UpdateLDBText(next(self.activeTasks), next(self.newTasks))
+
+	-- Reaching this point means the silent transaction produced a complete,
+	-- internally consistent list. Commit it once and release silent mode.
+	if mode == "silent" and self.silentRefreshInProgress then
+		self.pendingRefreshMode = nil
+		self.silentRefreshInProgress = false
+		self.silentRefreshBuilding = false
+
+		-- If another matching appearance was learned while this transaction was
+		-- still resolving, do one later debounced pass from the stable state.
+		if self.silentRefreshAgain then
+			self.silentRefreshAgain = nil
+			self.transmogRefreshTimer = self:ScheduleTimer(function()
+				self.transmogRefreshTimer = nil
+				self:Show("silent", true)
+			end, 3)
+		end
+	end
+
+	-- If this call temporarily switched to the background build state, publish
+	-- it only when complete; otherwise restore the last committed UI state.
+	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 end
- 
+
 function WQA:link(x)
 	if not x then
 		return ""
@@ -1107,6 +1348,7 @@ local SkipRewardDataPreloadQuests = {
  
 -- Process only quests in the pending reward queue
 function WQA:ProcessPendingRewards()
+	local enteredSilentBuildState = self:EnterSilentBuildState()
 	local retry = false
 	for questID, _ in pairs(self.pendingQuests or {}) do
 		local isEmissary = self.questList[questID] and self.questList[questID].isEmissary
@@ -1134,10 +1376,12 @@ function WQA:ProcessPendingRewards()
 	else
 		self.rewards = true
 		self.emissaryRewards = true
-		if self.lastMode then
-			self:CheckWQ(self.lastMode)
+		local callbackMode = self.pendingRefreshMode or self.lastMode
+		if callbackMode then
+			self:CheckWQ(callbackMode)
 		end
 	end
+	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 end
  
 function WQA:Reward()
@@ -1262,8 +1506,9 @@ function WQA:Reward()
 		self.event:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 	else
 		self.rewards = true
-		if self.lastMode then
-			self:CheckWQ(self.lastMode)
+		local callbackMode = self.pendingRefreshMode or self.lastMode
+		if callbackMode then
+			self:CheckWQ(callbackMode)
 		end
 	end
 end
@@ -1332,6 +1577,62 @@ function WQA:IsTransmogable(itemLink)
 	return true
 end
  
+function WQA:TrackActiveTransmogReward(itemLink, reason)
+	-- itemAppearanceID identifies the shared visual appearance.
+	-- itemModifiedAppearanceID identifies the exact transmog source.
+	local itemAppearanceID, itemModifiedAppearanceID = C_TransmogCollection.GetItemInfo(itemLink)
+
+	if reason == "appearance" and itemAppearanceID then
+		self.activeTransmogAppearanceIDs = self.activeTransmogAppearanceIDs or {}
+		self.activeTransmogAppearanceIDs[itemAppearanceID] = true
+	end
+
+	if itemModifiedAppearanceID then
+		self.activeTransmogSourceIDs = self.activeTransmogSourceIDs or {}
+		self.activeTransmogSourceIDs[itemModifiedAppearanceID] = true
+	end
+end
+
+function WQA:IsTrackedTransmogSourceRelevant(itemModifiedAppearanceID)
+	if not itemModifiedAppearanceID then
+		return false
+	end
+
+	-- Exact source match is relevant for either unknown-appearance or
+	-- unknown-source tracking.
+	if self.activeTransmogSourceIDs
+		and self.activeTransmogSourceIDs[itemModifiedAppearanceID] == true
+	then
+		return true
+	end
+
+	-- A different source can teach the same appearance. Resolve the source
+	-- event to its appearance ID and compare it with the appearances represented
+	-- by currently relevant WQ rewards.
+	local itemAppearanceID
+
+	if C_TransmogCollection.GetAppearanceSourceInfo then
+		local ok, info = pcall(C_TransmogCollection.GetAppearanceSourceInfo, itemModifiedAppearanceID)
+		if ok and info then
+			itemAppearanceID = info.itemAppearanceID
+		end
+	end
+
+	-- Fallback for API states where the newer structured source-info function
+	-- is unavailable.
+	if not itemAppearanceID and C_TransmogCollection.GetSourceInfo then
+		local ok, info = pcall(C_TransmogCollection.GetSourceInfo, itemModifiedAppearanceID)
+		if ok and info then
+			itemAppearanceID = info.visualID
+		end
+	end
+
+	return itemAppearanceID
+		and self.activeTransmogAppearanceIDs
+		and self.activeTransmogAppearanceIDs[itemAppearanceID] == true
+		or false
+end
+
 function WQA:CheckItems(questID, isEmissary)
 	local numQuestRewards = GetNumQuestLogRewards(questID)
  
@@ -1654,32 +1955,44 @@ function WQA:CheckReward(questID, isEmissary, rewardIndex)
 		if self.db.profile.options.reward.gear.unknownAppearance and self:IsTransmogable(itemLink) then
 			if itemClassID == 2 or itemClassID == 4 then
 				local transmog
+				local transmogReason
 				local searchForLinkResult = SearchAllTheThingsSafely(itemLink)
 				if searchForLinkResult and searchForLinkResult[1] then
 					local state = searchForLinkResult[1].collected
 					if not state then
 						transmog = "|TInterface\\Addons\\AllTheThings\\assets\\unknown:0|t"
+						transmogReason = "appearance"
 					elseif state == 2 and self.db.profile.options.reward.gear.unknownSource then
 						transmog = "|TInterface\\Addons\\AllTheThings\\assets\\known_circle:0|t"
+						transmogReason = "source"
 					end
 				end
- 
+
 				if CanIMogIt and not transmog then
 					if CanIMogIt:IsEquippable(itemLink) and CanIMogIt:CharacterCanLearnTransmog(itemLink) then
 						if not CanIMogIt:PlayerKnowsTransmog(itemLink) then
 							transmog = "|TInterface\\AddOns\\CanIMogIt\\Icons\\UNKNOWN:0|t"
+							transmogReason = "appearance"
 						elseif not CanIMogIt:PlayerKnowsTransmogFromItem(itemLink) and self.db.profile.options.reward.gear.unknownSource then
 							transmog = "|TInterface\\AddOns\\CanIMogIt\\Icons\\KNOWN_circle:0|t"
+							transmogReason = "source"
 						end
 					end
 				end
 				if transmog then
+					-- Only normal world-quest rewards participate in the targeted
+					-- collection refresh. Emissary/mission rewards keep their existing
+					-- behavior and cannot cause collection events to trigger a rescan.
+					if not isEmissary then
+						self:TrackActiveTransmogReward(itemLink, transmogReason)
+					end
+
 					local item = { itemLink = itemLink, transmog = transmog }
 					self:AddRewardToQuest(questID, "ITEM", item, isEmissary)
 				end
 			end
 		end
- 
+
 		-- Reputation Token
 		local factionID = ReputationItemList[itemID] or nil
 		if factionID then
@@ -1988,8 +2301,9 @@ function WQA:EmissaryReward()
 	else
 		GetBountiesForMapIDRequested = false
 		self.emissaryRewards = true
-		if self.lastMode then
-			self:CheckWQ(self.lastMode)
+		local callbackMode = self.pendingRefreshMode or self.lastMode
+		if callbackMode then
+			self:CheckWQ(callbackMode)
 		end
 	end
 end
@@ -2044,6 +2358,10 @@ local anchor
 function dataobj:OnEnter()
 	anchor = self
 	if not PopUpIsShown() then
+		-- Silent transmog refreshes are double-buffered: while the new scan is
+		-- resolving reward data, the last committed quest state remains live.
+		-- Hover therefore stays responsive and renders a fully consistent cached
+		-- list until the completed refresh is swapped in atomically.
 		-- Do not run a full WQA:Show()/CreateQuestList() scan from a mouse-hover
 		-- handler. Retail executes this synchronously on the UI thread and the old
 		-- behavior can freeze the client until all quest/reward data is rebuilt.

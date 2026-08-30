@@ -1,5 +1,10 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.0.6 - 2026-08-??
+
+After collecting a transmog appearance from a world quest a silent refresh will run a few seconds later in order to update the add-on's quest list.
+An issue where newly-appearing quests would not be grouped under the correct expansion section has been resolved.
+
 ## 1.0.5 - 2026-08-29
 
 Removed GameTooltipTemplate references from the addon which caused secret-value tooltip taint errors.

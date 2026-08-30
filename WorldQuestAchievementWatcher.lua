@@ -353,6 +353,16 @@ function WQA:OnEnable()
 				self:Show(deferredMode, true)
 			elseif name == "QUEST_TURNED_IN" then
 				self:HandleQuestTurnedIn(id)
+			elseif name == "QUEST_FINISHED" or name == "GOSSIP_CLOSED" then
+				if self.fullRefreshExplicitlyRequested then
+					self:ScheduleTimer(function()
+						if self.fullRefreshExplicitlyRequested and not self:IsQuestInteractionActive() then
+							self:TryStartSafeDiscovery()
+						end
+					end, 0.10)
+				else
+					self.event:UnregisterEvent(name)
+				end
 			elseif name == "GARRISON_MISSION_LIST_UPDATE" then
 				-- Do not inspect mission rewards directly from this event. Blizzard can
 				-- fire it repeatedly while mission data is being initialized. Mark the
@@ -415,7 +425,7 @@ function WQA:OnEnable()
 
 					-- Opening M by itself is passive. Only resume/start a cross-
 					-- expansion scan when the player explicitly requested one with
-					-- /wqaw refresh.
+					-- an explicit refresh action.
 					if self.fullRefreshExplicitlyRequested then
 						self:TryStartSafeDiscovery()
 					end
@@ -436,7 +446,7 @@ function WQA:OnEnable()
 	-- pause. Resume after the detail panel closes.
 	local function ResumeAfterQuestDetails()
 		self:ScheduleTimer(function()
-			if self.explicitWorldMapRefreshWindow and self.fullRefreshExplicitlyRequested then
+			if self.fullRefreshExplicitlyRequested and not self:IsQuestInteractionActive() then
 				self:TryStartSafeDiscovery()
 			end
 		end, 0.05)
@@ -466,17 +476,7 @@ function WQA:slash(input)
 	elseif arg1 == "new" then
 		self:AnnounceChat(self.newTasks or {})
 	elseif arg1 == "refresh" then
-		self.pendingSafeDiscoveryMode = "new"
-		self.fullRefreshExplicitlyRequested = true
-		self.lastSafeWindowReason = "manual /wqaw refresh"
-
-		if WorldMapFrame and WorldMapFrame:IsShown() and not self:IsQuestLogDetailActive() then
-			self.explicitWorldMapRefreshWindow = true
-		end
-
-		if not self:TryStartSafeDiscovery() then
-			print("|cff33ff99WQAW:|r Full refresh requested. Open the World Map (M) and leave it open until the scan finishes.")
-		end
+		self:RequestFullRefresh("manual /wqaw refresh", false)
 	elseif arg1 == "popup" then
 		self:Show("popup")
 	elseif arg1 == "options" then
@@ -503,6 +503,7 @@ function WQA:slash(input)
 		print("World quest safe window active: " .. tostring(self:IsSafeWorldQuestDiscoveryWindow()))
 		print("Explicit World Map refresh window: " .. tostring(self.explicitWorldMapRefreshWindow == true))
 		print("Full refresh explicitly requested: " .. tostring(self.fullRefreshExplicitlyRequested == true))
+		print("Full refresh settling: " .. tostring(self.fullRefreshSettling == true))
 		print("Pending full refresh mode: " .. tostring(self.pendingSafeDiscoveryMode or "none"))
 		print(self:GetLastFullScanStatusText())
 		print("Full scan timestamp type: " .. type(self.worldQuestFullScanCompletedAt))
@@ -825,23 +826,18 @@ function WQA:IsQuestLogDetailActive()
 end
 
 function WQA:IsSafeWorldQuestDiscoveryWindow()
-	if UnitOnTaxi and UnitOnTaxi("player") then
-		return not self:IsQuestLogDetailActive()
+	-- Full cross-expansion discovery remains explicit-only, but it no longer
+	-- requires the World Map to be open. The scan may run in the background as
+	-- long as the player is not actively using quest/gossip/detail UI.
+	if not self.fullRefreshExplicitlyRequested then
+		return false
 	end
 
-	-- WorldMapFrame is also the Quest Log parent in Retail. It is only a safe
-	-- WQAW refresh window when the player explicitly opened the World Map and is
-	-- not currently viewing a quest-detail panel.
-	if self.explicitWorldMapRefreshWindow
-		and WorldMapFrame
-		and WorldMapFrame.IsShown
-		and WorldMapFrame:IsShown()
-		and not self:IsQuestLogDetailActive()
-	then
-		return true
+	if self:IsQuestInteractionActive() then
+		return false
 	end
 
-	return false
+	return true
 end
 
 function WQA:SavePersistentDisplayCache()
@@ -1009,10 +1005,77 @@ function WQA:InitializeDeferredDataSources()
 	self:Debug("Deferred WQAW data sources initialized in safe window")
 end
 
+local FULL_REFRESH_SETTLE_SECONDS = 10
+
+function WQA:BeginFullRefreshSettlingPeriod()
+	if self.fullRefreshSettleTimer then
+		self:CancelTimer(self.fullRefreshSettleTimer)
+		self.fullRefreshSettleTimer = nil
+	end
+
+	self.fullRefreshSettling = true
+	self.fullRefreshSettlesAt = (GetTime and GetTime() or 0) + FULL_REFRESH_SETTLE_SECONDS
+
+	print(
+		"|cff33ff99WQAW:|r Full scan complete. "
+			.. "Waiting "
+			.. tostring(FULL_REFRESH_SETTLE_SECONDS)
+			.. " seconds for Blizzard quest data to settle..."
+	)
+
+	self.fullRefreshSettleTimer = self:ScheduleTimer(function()
+		self.fullRefreshSettleTimer = nil
+		self.fullRefreshSettling = false
+		self.fullRefreshSettlesAt = nil
+		print("|cff33ff99WQAW:|r Full refresh finished.")
+	end, FULL_REFRESH_SETTLE_SECONDS)
+end
+
+function WQA:RequestFullRefresh(reason, openWorldMap)
+	reason = reason or "manual refresh"
+
+	if self.fullRefreshSettling then
+		local remaining = 0
+		if self.fullRefreshSettlesAt and GetTime then
+			remaining = math.max(0, math.ceil(self.fullRefreshSettlesAt - GetTime()))
+		end
+
+		print(
+			"|cff33ff99WQAW:|r Blizzard quest data is still settling"
+				.. (remaining > 0 and (" (" .. tostring(remaining) .. "s remaining).") or ".")
+		)
+		return false
+	end
+
+	if self.fullRefreshExplicitlyRequested then
+		print("|cff33ff99WQAW:|r Full refresh is already in progress.")
+		return false
+	end
+
+	self.pendingSafeDiscoveryMode = "new"
+	self.fullRefreshExplicitlyRequested = true
+	self.lastSafeWindowReason = reason
+
+	-- These events are used only while an explicit full refresh is pending.
+	-- If the scan pauses because the player opens quest/gossip UI, closing that
+	-- interaction resumes the same refresh automatically.
+	self.event:RegisterEvent("QUEST_FINISHED")
+	self.event:RegisterEvent("GOSSIP_CLOSED")
+
+	print("|cff33ff99WQAW:|r Full refresh requested.")
+
+	if self:IsQuestInteractionActive() then
+		print("|cff33ff99WQAW:|r Waiting for the current quest interaction to finish.")
+		return false
+	end
+
+	return self:TryStartSafeDiscovery()
+end
+
 function WQA:TryStartSafeDiscovery()
-	-- Full cross-expansion discovery is manual-only. Merely opening the World
-	-- Map must never create quest API traffic that can delay an NPC interaction
-	-- after the map is closed.
+	-- Full cross-expansion discovery is explicit-only. Once requested it may
+	-- run in the background, but it pauses whenever quest/gossip/detail UI is
+	-- active.
 	if not self.fullRefreshExplicitlyRequested then
 		return false
 	end
@@ -1034,8 +1097,8 @@ function WQA:TryStartSafeDiscovery()
 		self:SchedulePendingRewardCheck(0.10)
 	end
 
-	-- Resume an interrupted safe-window discovery immediately when the map is
-	-- reopened instead of waiting for the old half-second pause timer.
+	-- Resume an interrupted explicit discovery as soon as quest interaction
+	-- is no longer blocking it.
 	if self.rewardScanInProgress then
 		self.rewardScanPausedForSafeWindow = false
 		if self.rewardScanTimer then
@@ -1053,8 +1116,7 @@ function WQA:TryStartSafeDiscovery()
 		return false
 	end
 
-	-- Opening the world map by itself must not start a cross-expansion scan.
-	-- Only login/periodic/game-setting events queue a refresh request.
+	-- Only an explicit user refresh action queues a full scan.
 	local mode = self.pendingSafeDiscoveryMode
 	if not mode then
 		return false
@@ -1110,6 +1172,10 @@ function WQA:FinishBackgroundScan(mode)
 		-- function. Save once more so the authoritative full-scan timestamp is
 		-- persisted with that same snapshot.
 		self:SavePersistentDisplayCache()
+
+		self.event:UnregisterEvent("QUEST_FINISHED")
+		self.event:UnregisterEvent("GOSSIP_CLOSED")
+		self:BeginFullRefreshSettlingPeriod()
 	end
 
 	self:RefreshVisibleTaskList()
@@ -1412,11 +1478,11 @@ function WQA:Show(mode, auto)
 		return
 	end
 
-	-- A full world-quest discovery scan is never allowed during ordinary play.
-	-- Queue it until the world map is open or the player is on a taxi.
+	-- An explicit full discovery may run without the World Map, but never while
+	-- the player is actively using quest/gossip/detail UI.
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
 		self.pendingSafeDiscoveryMode = mode or "new"
-		self:Debug("Deferring full WQ discovery until safe window", tostring(self.pendingSafeDiscoveryMode))
+		self:Debug("Deferring full WQ discovery until quest interaction is clear", tostring(self.pendingSafeDiscoveryMode))
 		return
 	end
 
@@ -2142,8 +2208,8 @@ function WQA:ProcessRewardPreloadQueue()
 		return
 	end
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
-		-- Do not poll every 0.5s during normal gameplay. WorldMapOnShow will
-		-- resume this queue the next time a safe refresh window opens.
+		-- Do not poll while quest interaction is blocking the explicit refresh.
+		-- QUEST_FINISHED / GOSSIP_CLOSED / quest-detail OnHide will resume it.
 		self.rewardPreloadPausedForSafeWindow = true
 		return
 	end
@@ -2408,9 +2474,9 @@ function WQA:ProcessRewardScanStep()
 		self.rewardScanQuestIndex = nil
 	end
 
-	-- Query one map per short tick while the world map/taxi safe window is open.
-	-- Because quest-giver interaction is impossible in that window, discovery can
-	-- be aggressive without blocking normal/daily quest acceptance.
+	-- Query one map per short tick during the explicit background refresh.
+	-- The scan still yields frequently and pauses whenever quest interaction is
+	-- detected.
 	local mapID = self.rewardScanMaps and self.rewardScanMaps[self.rewardScanMapIndex]
 	if mapID then
 		self.rewardScanMapIndex = self.rewardScanMapIndex + 1
@@ -3420,7 +3486,11 @@ end
  
 function dataobj:OnClick(button)
 	if button == "LeftButton" then
-		WQA:Show("popup")
+		if IsShiftKeyDown() then
+			WQA:RequestFullRefresh("minimap Shift+Left Click", false)
+		else
+			WQA:Show("popup")
+		end
 	elseif button == "RightButton" then
 		WQA:EnsureOptionsRegistered()
 		Settings.OpenToCategory(WQA.optionsCategoryID or (WQA.optionsFrame and WQA.optionsFrame.name))
@@ -3434,6 +3504,7 @@ function WQA:AnnounceLDB(quests)
 	end
  
 	self:CreateQTip()
+	self.tooltip.showMinimapRefreshHint = true
 	self.tooltip:SetAutoHideDelay(
 		.25,
 		anchor,

@@ -4,7 +4,9 @@
 
 Changed the way how and when WQAW quest list is updated.
 Unfortunately the only way to have it play nice with the game's interactions is by turning to manual mode of triggering a scan.
-From now on it is required to open the add-on interface by clicking the minimap icon or calling "/wqaw refresh" command in order to update the list.
+From now on it is required to open the add-on interface by clicking the minimap icon and clicking the refresh button,
+or calling "/wqaw refresh" command in order to update the list.
+If a quest-giver interface is opened the refresh command will wait until it is closed.
 This change is made to fix the issues the add-on would cause when trying to talk to quest-giving NPCs, interacting with the quest log, or interacting with quest items.
 Improvements for this system will be made in future versions in order to minimize the required user input in refreshing the list.
 

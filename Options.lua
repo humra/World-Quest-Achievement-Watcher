@@ -914,6 +914,16 @@ function WQA:UpdateOptions()
 							return not WQA.db.profile.options.LibDBIcon.hide
 						end,
 						order = newOrder()
+					},
+					refreshWorldQuests = {
+						type = "execute",
+						name = "Refresh World Quests",
+						desc = "Run a full cross-expansion world quest scan in the background. The scan pauses during quest interactions and has a 10-second settling period after completion.",
+						width = "double",
+						func = function()
+							WQA:RequestFullRefresh("settings Refresh World Quests button", false)
+						end,
+						order = newOrder()
 					}
 				}
 			}

@@ -558,6 +558,12 @@ function WQA:UpdateQTip(tasks)
             end
         end
     end
+
+    if tooltip.showMinimapRefreshHint then
+        tooltip:AddSeparator()
+        tooltip:AddLine("|cff33ff99Shift + Left Click:|r Full refresh")
+    end
+
     tooltip:Show()
 end
 
@@ -592,6 +598,39 @@ function WQA:AnnouncePopUp(quests, silent)
         PopUp:SetWidth(300)
         PopUp:SetHeight(100)
         PopUp:SetPoint("CENTER") --, self.db.profile.options.popupX, self.db.profile.options.popupY)
+
+        local RefreshButton = CreateFrame("Button", nil, PopUp, "UIPanelButtonTemplate")
+        RefreshButton:SetSize(82, 20)
+        RefreshButton:SetPoint("TOPLEFT", PopUp, "TOPLEFT", 10, -4)
+        RefreshButton:SetText("Refresh")
+        RefreshButton:SetScript(
+            "OnClick",
+            function()
+                WQA:RequestFullRefresh("popup Refresh button", false)
+            end
+        )
+        RefreshButton:SetScript(
+            "OnEnter",
+            function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_BOTTOMLEFT")
+                GameTooltip:SetText("Refresh World Quests")
+                GameTooltip:AddLine(
+                    "Run a full cross-expansion scan in the background. The scan pauses during quest interactions and has a 10-second settling period after completion.",
+                    1,
+                    1,
+                    1,
+                    true
+                )
+                GameTooltip:Show()
+            end
+        )
+        RefreshButton:SetScript(
+            "OnLeave",
+            function()
+                GameTooltip:Hide()
+            end
+        )
+        PopUp.RefreshButton = RefreshButton
         --PopUp:SetPoint("TOPLEFT", self.db.profile.options.popupX, self.db.profile.options.popupY)
         PopUp:Hide()
 
@@ -620,6 +659,7 @@ function WQA:AnnouncePopUp(quests, silent)
     PopUp:Show()
     PopUp.shown = true
     self:CreateQTip()
+    self.tooltip.showMinimapRefreshHint = false
     self.tooltip:SetAutoHideDelay()
     self.tooltip:ClearAllPoints()
     self.tooltip:SetPoint("TOP", PopUp, "TOP", 2, -27)

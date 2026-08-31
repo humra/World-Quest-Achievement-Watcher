@@ -335,6 +335,8 @@ function WQA:OnEnable()
 				-- busy even after the map closes. Full scans are manual-only.
 				self.pendingSafeDiscoveryMode = nil
 				self.fullRefreshExplicitlyRequested = false
+			elseif name == "ITEM_DATA_LOAD_RESULT" then
+				self:HandleDisplayItemDataResult(id, arg2)
 			elseif name == "QUEST_LOG_UPDATE" or name == "GET_ITEM_INFO_RECEIVED" then
 				-- Debounce to prevent rapid-fire reward processing
 				if self.rewardDebounceTimer then
@@ -498,6 +500,9 @@ function WQA:slash(input)
 		print("World quest discovery scan active: " .. tostring(self.rewardScanInProgress == true))
 		print("World quest discovery maps: " .. tostring(self.rewardScanMapsProcessed or 0) .. "/" .. tostring(self.rewardScanMaps and #self.rewardScanMaps or 0))
 		print("World quest discovery quests processed: " .. tostring(self.rewardScanQuestsProcessed or 0))
+		print("Full refresh map-data retries: " .. tostring(self.rewardScanMapRetries or 0))
+		print("Full refresh unresolved maps: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedMaps)))
+		print("Full refresh unresolved reward quests: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)))
 		print("World quest discovery paused for quest UI: " .. tostring(self.rewardScanPausedForQuestUI == true))
 		print("World quest discovery paused for safe window: " .. tostring(self.rewardScanPausedForSafeWindow == true))
 		print("World quest safe window active: " .. tostring(self:IsSafeWorldQuestDiscoveryWindow()))
@@ -601,7 +606,7 @@ function WQA:AddMounts(mounts)
 					if spellID == mount.spellID then
 						for _, v in pairs(mount.quest) do
 							if not IsQuestFlaggedCompleted(v.trackingID or 0) then
-								self:AddRewardToQuest(v.wqID, "CHANCE", mount.itemID)
+								self:AddChanceRewardToQuest(v.wqID, mount.itemID, mount.name)
 							end
 						end
 					end
@@ -629,7 +634,7 @@ function WQA:AddPets(pets)
 				for _, pet in pairs(pets) do
 					if companionID == pet.creatureID then
 						if pet.emissary == true then
-							self:AddEmissaryReward(pet.questID, "CHANCE", pet.itemID)
+							self:AddChanceRewardToQuest(pet.questID, pet.itemID, pet.name, true)
 						end
  
 						if pet.source and pet.source.type == "ITEM" then
@@ -637,13 +642,13 @@ function WQA:AddPets(pets)
 						end
  
 						if pet.questID then
-							self:AddRewardToQuest(pet.questID, "CHANCE", pet.itemID)
+							self:AddChanceRewardToQuest(pet.questID, pet.itemID, pet.name)
 						end
  
 						if pet.quest then
 							for _, v in pairs(pet.quest) do
 								if not IsQuestFlaggedCompleted(v.trackingID) then
-									self:AddRewardToQuest(v.wqID, "CHANCE", pet.itemID)
+									self:AddChanceRewardToQuest(v.wqID, pet.itemID, pet.name)
 								end
 							end
 						end
@@ -674,11 +679,11 @@ function WQA:AddToys(toys)
 					self.itemList[toy.source.itemID] = true
 				else
 					if toy.questID then
-						self:AddRewardToQuest(toy.questID, "CHANCE", toy.itemID)
+						self:AddChanceRewardToQuest(toy.questID, toy.itemID, toy.name)
 					else
 						for _, v in pairs(toy.quest) do
 							if not IsQuestFlaggedCompleted(v.trackingID) then
-								self:AddRewardToQuest(v.wqID, "CHANCE", toy.itemID)
+								self:AddChanceRewardToQuest(v.wqID, toy.itemID, toy.name)
 							end
 						end
 					end
@@ -731,6 +736,30 @@ function WQA:AddRewardToQuest(questID, rewardType, reward, emissary)
 	local l = self.questList[questID]
  
 	self:AddReward(l, rewardType, reward, emissary)
+end
+
+function WQA:SetChanceRewardDisplayName(questID, itemID, displayName)
+	if not displayName then
+		return
+	end
+
+	local quest = self.questList[questID]
+	local chance = quest and quest.reward and quest.reward.chance
+	if type(chance) ~= "table" then
+		return
+	end
+
+	for _, reward in ipairs(chance) do
+		if reward.id == itemID then
+			reward.displayName = displayName
+			return
+		end
+	end
+end
+
+function WQA:AddChanceRewardToQuest(questID, itemID, displayName, emissary)
+	self:AddRewardToQuest(questID, "CHANCE", itemID, emissary)
+	self:SetChanceRewardDisplayName(questID, itemID, displayName)
 end
  
 function WQA:AddEmissaryReward(questID, rewardType, reward)
@@ -1590,6 +1619,35 @@ function WQA:CheckWQ(mode)
 		return
 	end
 
+	-- Never publish an explicit full refresh while map/reward data is incomplete.
+	if self.backgroundScanInProgress then
+		local hasPendingRewards = self.pendingQuests and next(self.pendingQuests) ~= nil
+
+		if self.rewards ~= true or self.emissaryRewards ~= true or hasPendingRewards then
+			self:Debug(
+				"Full refresh waiting for complete reward data",
+				"rewards=" .. tostring(self.rewards),
+				"emissary=" .. tostring(self.emissaryRewards),
+				"pending=" .. tostring(hasPendingRewards)
+			)
+			self:ExitSilentBuildState(enteredSilentBuildState, false)
+			return
+		end
+
+		local complete, unresolvedMaps, unresolvedRewards, pendingRewards =
+			self:IsFullRefreshSnapshotComplete()
+
+		if not complete then
+			self:ExitSilentBuildState(enteredSilentBuildState, false)
+			self:AbortIncompleteFullRefresh(
+				unresolvedMaps,
+				unresolvedRewards,
+				pendingRewards
+			)
+			return
+		end
+	end
+
 
 	-- Silent transmog refreshes are transactional. CreateQuestList() rebuilds
 	-- questList/missionList immediately, while reward data can arrive over
@@ -1712,7 +1770,8 @@ function WQA:CheckWQ(mode)
  
 	self.activeTasks = {}
 	for id in pairs(activeQuests) do
-		table.insert(self.activeTasks, { id = id, type = "WORLD_QUEST" })
+		local mapID = self.questList[id] and self.questList[id].scanMapID
+		table.insert(self.activeTasks, { id = id, type = "WORLD_QUEST", mapId = mapID })
 	end
 	for id in pairs(activeMissions) do
 		table.insert(self.activeTasks, { id = id, type = "MISSION" })
@@ -2124,6 +2183,11 @@ local REWARD_SCAN_QUEST_BATCH_SIZE = 10
 local REWARD_SCAN_INTERACTION_RETRY = 0.25
 local REWARD_SCAN_SAFE_WINDOW_RETRY = 0.50
 
+-- Full refresh consistency safeguards.
+local FULL_SCAN_MAP_RETRY_LIMIT = 3
+local FULL_SCAN_MAP_RETRY_DELAY = 0.50
+local FULL_SCAN_REWARD_TIMEOUT = 15
+
 function WQA:IsQuestInteractionActive()
 	if QuestFrame and QuestFrame.IsShown and QuestFrame:IsShown() then
 		return true
@@ -2144,8 +2208,8 @@ function WQA:StopRewardPreloadQueue()
 	end
 	self.rewardPreloadQueue = {}
 	self.rewardPreloadQueued = {}
+	self.rewardPreloadForce = {}
 end
-
 function WQA:ResetRewardPreloadQueue()
 	self:StopRewardPreloadQueue()
 	if self.rewardPendingPollTimer then
@@ -2180,66 +2244,154 @@ function WQA:StartRewardPreloadQueue(delay)
 	end, delay or 0.1)
 end
 
-function WQA:QueueRewardPreload(questID)
+function WQA:QueueRewardPreload(questID, force)
 	if not questID or SkipRewardDataPreloadQuests[questID] then
 		return
 	end
-	if not HaveQuestData(questID) or HaveQuestRewardData(questID) then
+	if not HaveQuestData(questID) then
 		return
 	end
+	if HaveQuestRewardData(questID) and not force then
+		return
+	end
+
 	self.rewardPreloadQueue = self.rewardPreloadQueue or {}
 	self.rewardPreloadQueued = self.rewardPreloadQueued or {}
+	self.rewardPreloadForce = self.rewardPreloadForce or {}
 	self.rewardPreloadLastRequest = self.rewardPreloadLastRequest or {}
+
 	if self.rewardPreloadQueued[questID] then
+		if force then
+			self.rewardPreloadForce[questID] = true
+		end
 		return
 	end
+
 	local now = GetTime and GetTime() or 0
 	local lastRequest = self.rewardPreloadLastRequest[questID]
 	if lastRequest and now - lastRequest < REWARD_PRELOAD_RETRY_COOLDOWN then
 		return
 	end
+
 	self.rewardPreloadQueued[questID] = true
+	if force then
+		self.rewardPreloadForce[questID] = true
+	end
 	table.insert(self.rewardPreloadQueue, questID)
 	self:StartRewardPreloadQueue()
 end
-
 function WQA:ProcessRewardPreloadQueue()
 	if not self.rewardPreloadQueue or #self.rewardPreloadQueue == 0 then
 		return
 	end
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
-		-- Do not poll while quest interaction is blocking the explicit refresh.
-		-- QUEST_FINISHED / GOSSIP_CLOSED / quest-detail OnHide will resume it.
 		self.rewardPreloadPausedForSafeWindow = true
 		return
 	end
 	self.rewardPreloadPausedForSafeWindow = false
+
 	if self:IsQuestInteractionActive() then
 		self.rewardPreloadPausedForQuestUI = true
 		self:StartRewardPreloadQueue(REWARD_INTERACTION_RETRY)
 		return
 	end
 	self.rewardPreloadPausedForQuestUI = false
+
 	local questID = table.remove(self.rewardPreloadQueue, 1)
+	local force = self.rewardPreloadForce and self.rewardPreloadForce[questID] == true
 	if self.rewardPreloadQueued then
 		self.rewardPreloadQueued[questID] = nil
 	end
+	if self.rewardPreloadForce then
+		self.rewardPreloadForce[questID] = nil
+	end
+
 	if HaveQuestData(questID)
-		and not HaveQuestRewardData(questID)
+		and (force or not HaveQuestRewardData(questID))
 		and not SkipRewardDataPreloadQuests[questID]
 	then
 		C_TaskQuest.RequestPreloadRewardData(questID)
 		self.rewardPreloadLastRequest = self.rewardPreloadLastRequest or {}
 		self.rewardPreloadLastRequest[questID] = GetTime and GetTime() or 0
 		self.rewardPreloadRequestsThisScan = (self.rewardPreloadRequestsThisScan or 0) + 1
-		self:Debug("Reward preload request", questID, "queue remaining=" .. tostring(#self.rewardPreloadQueue))
+		self:Debug(
+			force and "Forced reward preload request" or "Reward preload request",
+			questID,
+			"queue remaining=" .. tostring(#self.rewardPreloadQueue)
+		)
 	end
+
 	if #self.rewardPreloadQueue > 0 then
 		self:StartRewardPreloadQueue(REWARD_PRELOAD_INTERVAL)
 	end
 end
- 
--- Process only quests in the pending reward queue
+function WQA:CountTableEntries(tbl)
+	local count = 0
+	for _ in pairs(tbl or {}) do
+		count = count + 1
+	end
+	return count
+end
+
+function WQA:IsFullRefreshSnapshotComplete()
+	local unresolvedMaps = self:CountTableEntries(self.rewardScanUnresolvedMaps)
+	local unresolvedRewards = self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)
+	local pendingRewards = self:CountTableEntries(self.pendingQuests)
+
+	return unresolvedMaps == 0
+		and unresolvedRewards == 0
+		and pendingRewards == 0
+		and self.rewards == true
+		and self.emissaryRewards == true,
+		unresolvedMaps,
+		unresolvedRewards,
+		pendingRewards
+end
+
+function WQA:AbortIncompleteFullRefresh(unresolvedMaps, unresolvedRewards, pendingRewards)
+	if self.rewardScanTimer then
+		self:CancelTimer(self.rewardScanTimer)
+		self.rewardScanTimer = nil
+	end
+	if self.rewardPendingPollTimer then
+		self:CancelTimer(self.rewardPendingPollTimer)
+		self.rewardPendingPollTimer = nil
+	end
+
+	self.event:UnregisterEvent("QUEST_LOG_UPDATE")
+	self.event:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
+	self.event:UnregisterEvent("QUEST_FINISHED")
+	self.event:UnregisterEvent("GOSSIP_CLOSED")
+	self:StopRewardPreloadQueue()
+
+	if self.backgroundScanCommittedState then
+		self:ApplyQuestRefreshState(self.backgroundScanCommittedState)
+	end
+
+	self.rewardScanInProgress = false
+	self.rewardScanCurrentQuests = nil
+	self.rewardScanCurrentMapID = nil
+	self.rewardScanQuestIndex = nil
+	self.backgroundScanInProgress = false
+	self.backgroundScanMode = nil
+	self.backgroundScanQueuedMode = nil
+	self.backgroundScanCommittedState = nil
+	self.fullRefreshExplicitlyRequested = false
+	self.pendingSafeDiscoveryMode = nil
+	self.rewardContinuationMode = nil
+
+	self:RefreshVisibleTaskList()
+	self:UpdateLDBText(next(self.activeTasks or {}), next(self.newTasks or {}))
+
+	print(
+		"|cff33ff99WQAW:|r Full refresh incomplete. Blizzard data was unavailable "
+			.. "(maps: " .. tostring(unresolvedMaps)
+			.. ", rewards: " .. tostring(unresolvedRewards)
+			.. ", pending: " .. tostring(pendingRewards)
+			.. "). Previous list retained."
+	)
+end
+
 function WQA:ProcessPendingRewards()
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
 		self.rewardPendingPausedForSafeWindow = true
@@ -2247,9 +2399,10 @@ function WQA:ProcessPendingRewards()
 	end
 	self.rewardPendingPausedForSafeWindow = false
 	self.rewardPreloadPausedForSafeWindow = false
+
 	if self:IsQuestInteractionActive() then
 		self.rewardPreloadPausedForQuestUI = true
-		self:SchedulePendingRewardCheck(REWARD_INTERACTION_RETRY)
+		self:SchedulePendingRewardCheck(REWARD_SCAN_INTERACTION_RETRY)
 		return
 	end
 
@@ -2261,19 +2414,42 @@ function WQA:ProcessPendingRewards()
 
 	local enteredSilentBuildState = self:EnterSilentBuildState()
 	local retry = false
+	local now = GetTime and GetTime() or 0
+
+	self.rewardScanRewardPendingSince = self.rewardScanRewardPendingSince or {}
+	self.rewardScanUnresolvedRewardQuests = self.rewardScanUnresolvedRewardQuests or {}
+
 	for questID, _ in pairs(self.pendingQuests or {}) do
 		local isEmissary = self.questList[questID] and self.questList[questID].isEmissary
+		local questNeedsRetry = false
+
 		if HaveQuestData(questID) and HaveQuestRewardData(questID) then
-			local questNeedsRetry = self:CheckItems(questID, isEmissary)
-			self:CheckCurrencies(questID, isEmissary)
-			if not questNeedsRetry then
-				self.pendingQuests[questID] = nil
-			else
-				retry = true
+			questNeedsRetry = self:CheckItems(questID, isEmissary)
+			if self:CheckCurrencies(questID, isEmissary) then
+				questNeedsRetry = true
 			end
 		else
 			self:QueueRewardPreload(questID)
-			retry = true
+			questNeedsRetry = true
+		end
+
+		if not questNeedsRetry then
+			self.pendingQuests[questID] = nil
+			self.rewardScanRewardPendingSince[questID] = nil
+		else
+			local firstPending = self.rewardScanRewardPendingSince[questID]
+			if not firstPending then
+				firstPending = now
+				self.rewardScanRewardPendingSince[questID] = firstPending
+			end
+
+			if now - firstPending >= FULL_SCAN_REWARD_TIMEOUT then
+				self.rewardScanUnresolvedRewardQuests[questID] = true
+				self.pendingQuests[questID] = nil
+				self:Debug("Reward data unresolved after timeout", questID)
+			else
+				retry = true
+			end
 		end
 	end
 
@@ -2286,11 +2462,18 @@ function WQA:ProcessPendingRewards()
 		self:StopRewardPreloadQueue()
 		self.rewards = true
 		self.emissaryRewards = true
-		local callbackMode = self.pendingRefreshMode or self.backgroundScanMode or self.rewardContinuationMode or self.lastMode
+
+		local callbackMode =
+			self.pendingRefreshMode
+			or self.backgroundScanMode
+			or self.rewardContinuationMode
+			or self.lastMode
+
 		if callbackMode then
 			self:CheckWQ(callbackMode)
 		end
 	end
+
 	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 end
 
@@ -2347,11 +2530,17 @@ function WQA:ProcessRewardQuest(mapID, questID)
 		if self:CheckItems(questID) then
 			questNeedsRetry = true
 		end
-		self:CheckCurrencies(questID)
+		if self:CheckCurrencies(questID) then
+			questNeedsRetry = true
+		end
 
 		if questNeedsRetry then
 			self.rewardScanRetry = true
 			self.pendingQuests[questID] = true
+		end
+
+		if self.questList[questID] then
+			self.questList[questID].scanMapID = mapID
 		end
 
 		local tradeskillLineID = questTagInfo and questTagInfo.tradeskillLineID
@@ -2379,6 +2568,17 @@ function WQA:ProcessRewardQuest(mapID, questID)
 			then
 				self:AddRewardToQuest(questID, "PROFESSION_SKILLUP", professionName)
 			end
+		end
+
+		-- Stamp after every reward category (including profession-only quests).
+		if self.questList[questID] then
+			self.questList[questID].scanMapID = mapID
+			self.questList[questID].rawItemRewardCount =
+				self.rewardScanRawItemRewardCounts and self.rewardScanRawItemRewardCounts[questID] or nil
+			self.questList[questID].rawCurrencyRewardCount =
+				self.rewardScanRawCurrencyRewardCounts and self.rewardScanRawCurrencyRewardCounts[questID] or nil
+			self.questList[questID].rawGoldRewardMoney =
+				self.rewardScanRawGoldRewardMoney and self.rewardScanRawGoldRewardMoney[questID] or nil
 		end
 	end
 end
@@ -2417,9 +2617,9 @@ function WQA:FinishRewardDiscoveryScan()
 	self:EmissaryReward()
 	self.rewardDiscoveryFinalizing = false
 
-	-- Normal scans can publish a coherent best-effort list now; missing reward
-	-- links continue loading through the paced queue. Silent transmog refreshes
-	-- remain atomic in CheckWQ until their pending reward data is complete.
+	-- Full refreshes are transactional. If reward/item data is still pending,
+	-- CheckWQ keeps the previous committed list visible and waits for
+	-- ProcessPendingRewards() instead of publishing a partial snapshot.
 	self:CheckWQ(self.backgroundScanMode or self.pendingRefreshMode or self.rewardContinuationMode or self.lastMode)
 end
 
@@ -2429,8 +2629,6 @@ function WQA:ProcessRewardScanStep()
 	end
 
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
-		-- Pause completely. Do not leave a half-second AceTimer polling loop
-		-- running while the player is using normal quest UI.
 		self.rewardScanPausedForSafeWindow = true
 		return
 	end
@@ -2445,9 +2643,6 @@ function WQA:ProcessRewardScanStep()
 
 	local enteredSilentBuildState = self:EnterSilentBuildState()
 
-	-- Process a small batch of world quests, then yield back to Blizzard.
-	-- This is much faster than one quest per timer tick without returning to
-	-- the old uninterrupted scan that interfered with quest NPC interaction.
 	if self.rewardScanCurrentQuests then
 		local processedThisTick = 0
 
@@ -2474,15 +2669,66 @@ function WQA:ProcessRewardScanStep()
 		self.rewardScanQuestIndex = nil
 	end
 
-	-- Query one map per short tick during the explicit background refresh.
-	-- The scan still yields frequently and pauses whenever quest interaction is
-	-- detected.
 	local mapID = self.rewardScanMaps and self.rewardScanMaps[self.rewardScanMapIndex]
 	if mapID then
+		local quests = C_TaskQuest.GetQuestsOnMap(mapID)
+		local accumulated = self.rewardScanMapAccumulatedQuests[mapID] or {}
+		self.rewardScanMapAccumulatedQuests[mapID] = accumulated
+
+		if quests then
+			for _, quest in ipairs(quests) do
+				if quest and quest.questID then
+					accumulated[quest.questID] = quest
+				end
+			end
+		end
+
+		local previous = self.rewardScanPreviousActiveQuestsByMap[mapID]
+		local missingPrevious = 0
+		if previous then
+			for questID in pairs(previous) do
+				if not accumulated[questID] then
+					missingPrevious = missingPrevious + 1
+				end
+			end
+		end
+
+		local suspicious = missingPrevious > 0
+		if suspicious then
+			local attempts = (self.rewardScanMapRetryCounts[mapID] or 0) + 1
+			self.rewardScanMapRetryCounts[mapID] = attempts
+			self.rewardScanMapRetries = (self.rewardScanMapRetries or 0) + 1
+
+			self:Debug(
+				"Retrying map quest data",
+				mapID,
+				"attempt=" .. tostring(attempts),
+				"nil=" .. tostring(quests == nil),
+				"missingPrevious=" .. tostring(missingPrevious)
+			)
+
+			if attempts < FULL_SCAN_MAP_RETRY_LIMIT then
+				self:ExitSilentBuildState(enteredSilentBuildState, false)
+				self:ScheduleRewardScanStep(FULL_SCAN_MAP_RETRY_DELAY)
+				return
+			end
+
+			if missingPrevious > 0 then
+				self.rewardScanUnresolvedMaps[mapID] = true
+				self:Debug("Map still missing previously active quests after retries", mapID)
+			end
+		end
+
+		local acceptedQuests = {}
+		for _, quest in pairs(accumulated) do
+			table.insert(acceptedQuests, quest)
+		end
+
+		self.rewardScanMapAccumulatedQuests[mapID] = nil
 		self.rewardScanMapIndex = self.rewardScanMapIndex + 1
 		self.rewardScanMapsProcessed = (self.rewardScanMapsProcessed or 0) + 1
 		self.rewardScanCurrentMapID = mapID
-		self.rewardScanCurrentQuests = C_TaskQuest.GetQuestsOnMap(mapID) or {}
+		self.rewardScanCurrentQuests = acceptedQuests
 		self.rewardScanQuestIndex = 1
 
 		self:ExitSilentBuildState(enteredSilentBuildState, false)
@@ -2490,6 +2736,9 @@ function WQA:ProcessRewardScanStep()
 		if #self.rewardScanCurrentQuests > 0 then
 			self:ScheduleRewardScanStep(REWARD_SCAN_QUEST_INTERVAL)
 		else
+			self.rewardScanCurrentQuests = nil
+			self.rewardScanCurrentMapID = nil
+			self.rewardScanQuestIndex = nil
 			self:ScheduleRewardScanStep(REWARD_SCAN_MAP_INTERVAL)
 		end
 		return
@@ -2538,6 +2787,37 @@ function WQA:Reward()
 	self.rewardScanMapsProcessed = 0
 	self.rewardScanQuestsProcessed = 0
 	self.rewardScanPausedForQuestUI = false
+	self.rewardScanMapRetryCounts = {}
+	self.rewardScanMapRetries = 0
+	self.rewardScanUnresolvedMaps = {}
+	self.rewardScanMapAccumulatedQuests = {}
+	self.rewardScanRewardPendingSince = {}
+	self.rewardScanUnresolvedRewardQuests = {}
+	self.rewardScanPreviousActiveQuestsByMap = {}
+	self.rewardScanRawItemRewardCounts = {}
+	self.rewardScanRawCurrencyRewardCounts = {}
+	self.rewardScanRawGoldRewardMoney = {}
+
+	local previousState = self.backgroundScanCommittedState
+	local now = GetServerTime and GetServerTime() or time()
+	if previousState and type(previousState.activeTasks) == "table" then
+		for _, task in ipairs(previousState.activeTasks) do
+			if task.type == "WORLD_QUEST"
+				and (not task.expiresAt or task.expiresAt > now)
+			then
+				local previousQuest = previousState.questList and previousState.questList[task.id]
+				local mapID =
+					task.mapId
+					or (previousQuest and previousQuest.scanMapID)
+					or C_TaskQuest.GetQuestZoneID(task.id)
+				if mapID then
+					self.rewardScanPreviousActiveQuestsByMap[mapID] =
+						self.rewardScanPreviousActiveQuestsByMap[mapID] or {}
+					self.rewardScanPreviousActiveQuestsByMap[mapID][task.id] = true
+				end
+			end
+		end
+	end
 
 	self:Debug("Reward discovery maps queued", #self.rewardScanMaps)
 	self:ScheduleRewardScanStep(0.1)
@@ -2765,13 +3045,75 @@ function WQA:RefreshTrackedTransmogQuests(questIDs)
 end
 
 
-function WQA:CheckItems(questID, isEmissary)
-	local numQuestRewards = GetNumQuestLogRewards(questID)
- 
-	if numQuestRewards == 0 then
+function WQA:GetPreviousCommittedQuestData(questID)
+	local state = self.backgroundScanCommittedState
+	if not state or type(state.questList) ~= "table" then
+		return nil
+	end
+	return state.questList[questID]
+end
+
+function WQA:PreviousCommittedQuestHadItemReward(questID)
+	local previous = self:GetPreviousCommittedQuestData(questID)
+	if not previous then
 		return false
 	end
- 
+
+	if type(previous.rawItemRewardCount) == "number" and previous.rawItemRewardCount > 0 then
+		return true
+	end
+
+	local reward = previous.reward
+	if type(reward) ~= "table" then
+		return false
+	end
+
+	return reward.customItem ~= nil
+		or reward.item ~= nil
+		or reward.recipe ~= nil
+		or reward.azeriteTraits ~= nil
+end
+
+function WQA:PreviousCommittedQuestHadCurrencyReward(questID)
+	local previous = self:GetPreviousCommittedQuestData(questID)
+	if not previous then
+		return false
+	end
+
+	if type(previous.rawCurrencyRewardCount) == "number" and previous.rawCurrencyRewardCount > 0 then
+		return true
+	end
+
+	return previous.reward and previous.reward.currency ~= nil
+end
+
+function WQA:PreviousCommittedQuestHadGoldReward(questID)
+	local previous = self:GetPreviousCommittedQuestData(questID)
+	if not previous then
+		return false
+	end
+
+	if type(previous.rawGoldRewardMoney) == "number" and previous.rawGoldRewardMoney > 0 then
+		return true
+	end
+
+	return previous.reward and previous.reward.gold ~= nil
+end
+
+function WQA:CheckItems(questID, isEmissary)
+	local numQuestRewards = GetNumQuestLogRewards(questID) or 0
+	self.rewardScanRawItemRewardCounts = self.rewardScanRawItemRewardCounts or {}
+	self.rewardScanRawItemRewardCounts[questID] = numQuestRewards
+
+	if numQuestRewards == 0 then
+		if self.backgroundScanInProgress and self:PreviousCommittedQuestHadItemReward(questID) then
+			self:Debug("Previously tracked item reward unexpectedly returned zero", questID)
+			self:QueueRewardPreload(questID, true)
+			return true
+		end
+		return false
+	end
+
 	local retryArray = {}
  
 	for rewardIndex = 1, numQuestRewards do
@@ -3154,47 +3496,118 @@ function WQA:CheckReward(questID, isEmissary, rewardIndex)
 end
  
 function WQA:CheckCurrencies(questID, isEmissary)
-	local questRewardCurrencies = C_QuestLog.GetQuestRewardCurrencies(questID)
- 
+	local retry = false
+	local questRewardCurrencies = C_QuestLog.GetQuestRewardCurrencies(questID) or {}
+
+	self.rewardScanRawCurrencyRewardCounts = self.rewardScanRawCurrencyRewardCounts or {}
+	self.rewardScanRawCurrencyRewardCounts[questID] = #questRewardCurrencies
+
+	if #questRewardCurrencies == 0
+		and self.backgroundScanInProgress
+		and self:PreviousCommittedQuestHadCurrencyReward(questID)
+	then
+		self:Debug("Previously tracked currency reward unexpectedly returned empty", questID)
+		self:QueueRewardPreload(questID, true)
+		retry = true
+	end
+
 	for _, currencyInfo in ipairs(questRewardCurrencies) do
 		local currencyID = currencyInfo.currencyID
 		local amount = currencyInfo.totalRewardAmount
- 
+
 		if self.db.profile.options.reward.currency[currencyID] then
 			local currency = { currencyID = currencyID, amount = amount }
 			self:AddRewardToQuest(questID, "CURRENCY", currency, isEmissary)
 		end
- 
-		-- Reputation Currency
+
 		local factionID = ReputationCurrencyList[currencyID] or nil
-		if factionID then
-			if self.db.profile.options.reward.reputation[factionID] == true then
-				local reputation = {
-					name = currencyInfo.name,
-					currencyID = currencyID,
-					amount = amount,
-					factionID = factionID
-				}
-				self:AddRewardToQuest(questID, "REPUTATION", reputation, isEmissary)
-			end
+		if factionID and self.db.profile.options.reward.reputation[factionID] == true then
+			local reputation = {
+				name = currencyInfo.name,
+				currencyID = currencyID,
+				amount = amount,
+				factionID = factionID
+			}
+			self:AddRewardToQuest(questID, "REPUTATION", reputation, isEmissary)
 		end
 	end
- 
-	local gold = math.floor(GetQuestLogRewardMoney(questID) / 10000) or 0
+
+	local rawGoldMoney = GetQuestLogRewardMoney(questID) or 0
+	self.rewardScanRawGoldRewardMoney = self.rewardScanRawGoldRewardMoney or {}
+	self.rewardScanRawGoldRewardMoney[questID] = rawGoldMoney
+
+	if rawGoldMoney == 0
+		and self.backgroundScanInProgress
+		and self:PreviousCommittedQuestHadGoldReward(questID)
+	then
+		self:Debug("Previously tracked gold reward unexpectedly returned zero", questID)
+		self:QueueRewardPreload(questID, true)
+		retry = true
+	end
+
+	local gold = math.floor(rawGoldMoney / 10000)
 	if gold > 0 then
 		if self.db.profile.options.reward.general.gold and gold >= self.db.profile.options.reward.general.goldMin then
 			self:AddRewardToQuest(questID, "GOLD", gold, isEmissary)
 		end
 	end
+
+	return retry
 end
- 
-WQA.debug = false
 function WQA:Debug(...)
 	if self.debug == true then
 		print(GetTime(), GetFramerate(), ...)
 	end
 end
  
+function WQA:RequestDisplayItemData(itemID)
+	if type(itemID) ~= "number" or not C_Item or not C_Item.RequestLoadItemDataByID then
+		return
+	end
+
+	self.pendingDisplayItemIDs = self.pendingDisplayItemIDs or {}
+	self.displayItemLoadLastRequest = self.displayItemLoadLastRequest or {}
+
+	if self.pendingDisplayItemIDs[itemID] then
+		return
+	end
+
+	local now = GetTime and GetTime() or 0
+	local lastRequest = self.displayItemLoadLastRequest[itemID]
+	if lastRequest and now - lastRequest < 10 then
+		return
+	end
+
+	self.pendingDisplayItemIDs[itemID] = true
+	self.displayItemLoadLastRequest[itemID] = now
+	self.event:RegisterEvent("ITEM_DATA_LOAD_RESULT")
+	C_Item.RequestLoadItemDataByID(itemID)
+end
+
+function WQA:HandleDisplayItemDataResult(itemID, success)
+	if not self.pendingDisplayItemIDs or not self.pendingDisplayItemIDs[itemID] then
+		return
+	end
+
+	self.pendingDisplayItemIDs[itemID] = nil
+
+	if success then
+		self.displayItemLoadLastRequest[itemID] = nil
+		-- Rebuilding the visible list will resolve and cache the real item link.
+		self:RefreshVisibleTaskList()
+
+		-- Never persist a background build. During normal display-only loading,
+		-- save the newly resolved item link into the committed display cache.
+		if not self.backgroundScanInProgress then
+			self:SavePersistentDisplayCache()
+		end
+	end
+
+	if not next(self.pendingDisplayItemIDs) then
+		self.event:UnregisterEvent("ITEM_DATA_LOAD_RESULT")
+	end
+end
+
 function WQA:GetRewardTextByID(questID, key, value, i, type)
 	local k, v = key, value
 	local text
@@ -3228,7 +3641,8 @@ function WQA:GetRewardTextByID(questID, key, value, i, type)
 		-- Never let a missing link prevent the world quest itself from being shown.
 		if not text then
 			if k == "chance" and v[i] and v[i].id then
-				text = "Item " .. tostring(v[i].id)
+				self:RequestDisplayItemData(v[i].id)
+				text = v[i].displayName or ("Item " .. tostring(v[i].id))
 			elseif k == "achievement" and v[i] and v[i].id then
 				text = "Achievement " .. tostring(v[i].id)
 			elseif k == "azeriteTraits" and v[i] and v[i].spellID then
@@ -3258,6 +3672,11 @@ function WQA:GetRewardLinkByID(questID, key, value, i)
 			return nil
 		end
 		link = v[i].itemLink or select(2, GetItemInfo(v[i].id))
+		if link then
+			v[i].itemLink = link
+		else
+			self:RequestDisplayItemData(v[i].id)
+		end
 	elseif k == "custom" then
 		return nil
 	elseif k == "item" then
@@ -3389,7 +3808,10 @@ function WQA:EmissaryReward()
 						retry = true
 						self.pendingQuests[questID] = true
 					end
-					self:CheckCurrencies(questID, true)
+					if self:CheckCurrencies(questID, true) then
+						retry = true
+						self.pendingQuests[questID] = true
+					end
 				else
 					retry = true
 					self.pendingQuests[questID] = true

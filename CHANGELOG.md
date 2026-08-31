@@ -1,10 +1,17 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.1.1 - 2026-09-01
+
+Full refresh should no longer be inconsistent in gathering data.
+Adding custom tracked rewards now works as intented.
+Options menu elements width should now scale properly with screen resolution.
+If the list encounters an error when gathering a clickable item link for one of the quest rewards it will now display it's full name instead of just item ID.
+
 ## 1.1.0 - 2026-08-30
 
 Changed the way how and when WQAW quest list is updated.
 Unfortunately the only way to have it play nice with the game's interactions is by turning to manual mode of triggering a scan.
-From now on it is required to open the add-on interface by clicking the minimap icon and clicking the refresh button,
+From now on it is required to open the add-on interface by shift-clicking minimap icon, opening the minimap icon and clicking the refresh button,
 or calling "/wqaw refresh" command in order to update the list.
 If a quest-giver interface is opened the refresh command will wait until it is closed.
 This change is made to fix the issues the add-on would cause when trying to talk to quest-giving NPCs, interacting with the quest log, or interacting with quest items.

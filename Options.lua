@@ -521,7 +521,7 @@ function WQA:UpdateOptions()
 								order = newOrder(),
 								type = "execute",
 								name = L["Add"],
-								width = .3,
+								width = .5,
 								func = function()
 									WQA:CreateCustomQuest()
 								end,
@@ -554,22 +554,27 @@ function WQA:UpdateOptions()
 							},
 							itemID = {
 								name = L["itemID"],
-								-- desc = "To add a worldquest, enter a unique name for the worldquest, and click Okay",
+								desc = "Enter a numeric item ID and press Enter to confirm it before clicking Add.",
 								type = "input",
 								order = newOrder(),
 								width = .6,
 								set = function(info, val)
-									WQA.data.custom.worldQuestReward = val
+									local itemID = tonumber(val)
+									if itemID and itemID > 0 and itemID == math.floor(itemID) then
+										WQA.data.custom.worldQuestReward = tostring(itemID)
+									else
+										WQA.data.custom.worldQuestReward = nil
+									end
 								end,
 								get = function()
-									return tostring(WQA.data.custom.worldQuestReward or 0)
+									return tostring(WQA.data.custom.worldQuestReward or "")
 								end
 							},
 							button = {
 								order = newOrder(),
 								type = "execute",
 								name = L["Add"],
-								width = .3,
+								width = .5,
 								func = function()
 									WQA:CreateCustomReward()
 								end
@@ -640,7 +645,7 @@ function WQA:UpdateOptions()
 								order = newOrder(),
 								type = "execute",
 								name = L["Add"],
-								width = .3,
+								width = .5,
 								func = function()
 									WQA:CreateCustomMission()
 								end
@@ -681,7 +686,7 @@ function WQA:UpdateOptions()
 								order = newOrder(),
 								type = "execute",
 								name = L["Add"],
-								width = .3,
+								width = .5,
 								func = function()
 									WQA:CreateCustomMissionReward()
 								end
@@ -1522,14 +1527,37 @@ function WQA:UpdateCustomQuests()
 end
 
 function WQA:CreateCustomReward()
+	local itemID = tonumber(self.data.custom.worldQuestReward)
+	if not itemID or itemID <= 0 or itemID ~= math.floor(itemID) then
+		print("|cff33ff99WQAW:|r Enter a valid numeric item ID, press Enter to confirm it, then click Add.")
+		return false
+	end
+
 	if not self.db.global.custom then
 		self.db.global.custom = {}
 	end
 	if not self.db.global.custom.worldQuestReward then
 		self.db.global.custom.worldQuestReward = {}
 	end
-	self.db.global.custom.worldQuestReward[tonumber(self.data.custom.worldQuestReward)] = true
+	if not self.db.profile.custom then
+		self.db.profile.custom = {}
+	end
+	if not self.db.profile.custom.worldQuestReward then
+		self.db.profile.custom.worldQuestReward = {}
+	end
+
+	self.db.global.custom.worldQuestReward[itemID] = true
+	self.db.profile.custom.worldQuestReward[itemID] = true
+	self.data.custom.worldQuestReward = nil
+
+	if C_Item and C_Item.RequestLoadItemDataByID then
+		C_Item.RequestLoadItemDataByID(itemID)
+	end
+
 	self:UpdateCustomRewards()
+	LibStub("AceConfigRegistry-3.0"):NotifyChange("WorldQuestAchievementWatcher")
+	print("|cff33ff99WQAW:|r Added custom World Quest reward item ID " .. tostring(itemID) .. ".")
+	return true
 end
 
 function WQA:UpdateCustomRewards()

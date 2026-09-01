@@ -500,9 +500,12 @@ function WQA:slash(input)
 		print("World quest discovery scan active: " .. tostring(self.rewardScanInProgress == true))
 		print("World quest discovery maps: " .. tostring(self.rewardScanMapsProcessed or 0) .. "/" .. tostring(self.rewardScanMaps and #self.rewardScanMaps or 0))
 		print("World quest discovery quests processed: " .. tostring(self.rewardScanQuestsProcessed or 0))
+		print("Full refresh map discovery passes: " .. tostring(self.rewardScanMapPass or 0))
 		print("Full refresh map-data retries: " .. tostring(self.rewardScanMapRetries or 0))
 		print("Full refresh unresolved maps: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedMaps)))
 		print("Full refresh unresolved reward quests: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)))
+		print("Full refresh Area POI retries: " .. tostring(self.areaPoiConsistencyRetries or 0))
+		print("Full refresh unresolved Area POIs: " .. tostring(self:CountTableEntries(self.areaPoiUnresolved)))
 		print("World quest discovery paused for quest UI: " .. tostring(self.rewardScanPausedForQuestUI == true))
 		print("World quest discovery paused for safe window: " .. tostring(self.rewardScanPausedForSafeWindow == true))
 		print("World quest safe window active: " .. tostring(self:IsSafeWorldQuestDiscoveryWindow()))
@@ -536,6 +539,133 @@ function WQA:slash(input)
 	end
 end
 
+local function CloneConsistencyValue(value, seen)
+	if type(value) ~= "table" then
+		return value
+	end
+
+	seen = seen or {}
+	if seen[value] then
+		return seen[value]
+	end
+
+	local copy = {}
+	seen[value] = copy
+	for key, child in pairs(value) do
+		copy[CloneConsistencyValue(key, seen)] = CloneConsistencyValue(child, seen)
+	end
+	return copy
+end
+
+function WQA:GetAreaPoiConsistencyKey(poiID, mapID)
+	return tostring(poiID) .. ":" .. tostring(mapID)
+end
+
+function WQA:GetAreaPoiExpiration(poiID, schedulerInfo, entry)
+	local now = GetServerTime and GetServerTime() or time()
+
+	if schedulerInfo and type(schedulerInfo.endTime) == "number" and schedulerInfo.endTime > now then
+		return schedulerInfo.endTime
+	end
+
+	if entry and type(entry.endTime) == "number" and entry.endTime > now then
+		return entry.endTime
+	end
+
+	if C_AreaPoiInfo and C_AreaPoiInfo.GetAreaPOISecondsLeft then
+		local okSeconds, seconds = pcall(C_AreaPoiInfo.GetAreaPOISecondsLeft, poiID)
+		if okSeconds and type(seconds) == "number" and seconds > 0 then
+			return now + seconds
+		end
+	end
+
+	if entry and type(entry.expiresAt) == "number" and entry.expiresAt > now then
+		return entry.expiresAt
+	end
+
+	return nil
+end
+
+function WQA:PrepareAreaPoiConsistencyState()
+	self.areaPoiExpectedActive = {}
+	self.areaPoiPreviousActiveEntries = {}
+	self.areaPoiConsistencyRetryCounts = {}
+	self.areaPoiConsistencyRetries = 0
+	self.areaPoiUnresolved = {}
+	self.areaPoiConsistencyCheckPass = 0
+
+	if not self.fullRefreshExplicitlyRequested then
+		return
+	end
+
+	local previousState = self.backgroundScanCommittedState
+	if not previousState or type(previousState.activeTasks) ~= "table" then
+		return
+	end
+
+	local now = GetServerTime and GetServerTime() or time()
+
+	for _, task in ipairs(previousState.activeTasks) do
+		if task.type == "AREA_POI" and task.id and task.mapId then
+			local previousEntry =
+				previousState.areaPoiList
+				and previousState.areaPoiList[task.id]
+				and previousState.areaPoiList[task.id][task.mapId]
+				or nil
+
+			local schedulerInfo = self:GetScheduledAreaPoiInfo(task.id, task.mapId)
+			local scenarioInfo = self:GetScenarioAreaPoiInfo(task.id, task.mapId)
+			local poiInfo = C_AreaPoiInfo.GetAreaPOIInfo(task.mapId, task.id)
+
+			local expectedUntil =
+				(type(task.expiresAt) == "number" and task.expiresAt)
+				or (previousEntry and type(previousEntry.expiresAt) == "number" and previousEntry.expiresAt)
+				or self:GetAreaPoiExpiration(task.id, schedulerInfo, previousEntry)
+
+			-- A direct live source at the start of this refresh is authoritative
+			-- even for untimed POIs. Protect it for the duration of this scan so
+			-- a second transient Blizzard query cannot remove it moments later.
+			if (poiInfo or schedulerInfo or scenarioInfo) and (not expectedUntil or expectedUntil <= now) then
+				expectedUntil = now + 60
+			end
+
+			if type(expectedUntil) == "number" and expectedUntil > now then
+				local key = self:GetAreaPoiConsistencyKey(task.id, task.mapId)
+				self.areaPoiExpectedActive[key] = expectedUntil
+				if previousEntry then
+					self.areaPoiPreviousActiveEntries[key] = previousEntry
+				end
+			end
+		end
+	end
+end
+
+function WQA:SeedExpectedAreaPoiRegistrations()
+	if not self.fullRefreshExplicitlyRequested then
+		return
+	end
+
+	for key, expectedUntil in pairs(self.areaPoiExpectedActive or {}) do
+		local previousEntry = self.areaPoiPreviousActiveEntries and self.areaPoiPreviousActiveEntries[key]
+		if previousEntry then
+			local poiID, mapID = string.match(key, "^(%-?%d+):(%-?%d+)$")
+			poiID = tonumber(poiID)
+			mapID = tonumber(mapID)
+
+			if poiID and mapID then
+				self.Criterias.AreaPoi.list[poiID] = self.Criterias.AreaPoi.list[poiID] or {}
+
+				if not self.Criterias.AreaPoi.list[poiID][mapID] then
+					self.Criterias.AreaPoi.list[poiID][mapID] = CloneConsistencyValue(previousEntry)
+					self.Criterias.AreaPoi.list[poiID][mapID]._wqawConsistencyFallback = true
+				end
+
+				self.Criterias.AreaPoi.list[poiID][mapID]._wqawExpectedUntil = expectedUntil
+			end
+		end
+	end
+end
+
 function WQA:CreateQuestList()
 	self:Debug("CreateQuestList")
 	if C_EventScheduler and C_EventScheduler.GetOngoingEvents and
@@ -545,6 +675,12 @@ function WQA:CreateQuestList()
 	end
 	self.scenarioDirty = false
 	self.missionsDirty = false
+
+	-- Capture currently committed Area POIs before the build tables are reset.
+	-- A live/timed POI that vanishes from a later Blizzard query during this same
+	-- explicit refresh is treated as unresolved rather than inactive.
+	self:PrepareAreaPoiConsistencyState()
+
 	self.questList = {}
 	-- Rebuilt on every full scan. These contain only transmog rewards currently
 	-- relevant to active world quests, so unrelated collection changes do not
@@ -584,6 +720,7 @@ function WQA:CreateQuestList()
  
 	self:AddCustom()
 	self:Special()
+	self:SeedExpectedAreaPoiRegistrations()
 	self:Reward()
 	-- Emissary rewards are scanned after the paced world-quest discovery pass.
 end
@@ -1188,6 +1325,8 @@ function WQA:FinishBackgroundScan(mode)
 	self.backgroundScanInProgress = false
 	self.backgroundScanCommittedState = nil
 	self.backgroundScanMode = nil
+	self.areaPoiExpectedActive = nil
+	self.areaPoiPreviousActiveEntries = nil
 
 	-- One explicit /wqaw refresh authorizes one complete cross-expansion scan.
 	-- After it commits, opening M goes back to being completely passive.
@@ -1634,7 +1773,7 @@ function WQA:CheckWQ(mode)
 			return
 		end
 
-		local complete, unresolvedMaps, unresolvedRewards, pendingRewards =
+		local complete, unresolvedMaps, unresolvedRewards, pendingRewards, unresolvedAreaPois =
 			self:IsFullRefreshSnapshotComplete()
 
 		if not complete then
@@ -1642,7 +1781,8 @@ function WQA:CheckWQ(mode)
 			self:AbortIncompleteFullRefresh(
 				unresolvedMaps,
 				unresolvedRewards,
-				pendingRewards
+				pendingRewards,
+				unresolvedAreaPois
 			)
 			return
 		end
@@ -1684,9 +1824,17 @@ function WQA:CheckWQ(mode)
 	local newQuests = {}
 	local retry = false
 	for questID, _ in pairs(self.questList) do
+		-- During an explicit full refresh the accepted GetQuestsOnMap snapshot is
+		-- authoritative. Do not let a second, transient C_TaskQuest.IsActive()
+		-- answer remove a quest that the same refresh just discovered.
+		local discoveredByFullScan =
+			self.backgroundScanInProgress
+			and self.rewardScanDiscoveredQuestIDs
+			and self.rewardScanDiscoveredQuestIDs[questID] ~= nil
+
 		if
-			IsActive(questID) or self:EmissaryIsActive(questID) or self:isQuestPinActive(questID) or
-			self:IsQuestFlaggedCompleted(questID)
+			discoveredByFullScan or IsActive(questID) or self:EmissaryIsActive(questID) or
+			self:isQuestPinActive(questID) or self:IsQuestFlaggedCompleted(questID)
 		then
 			local questLink = self:GetTaskLink({ id = questID, type = "WORLD_QUEST" })
 			local link
@@ -1770,7 +1918,9 @@ function WQA:CheckWQ(mode)
  
 	self.activeTasks = {}
 	for id in pairs(activeQuests) do
-		local mapID = self.questList[id] and self.questList[id].scanMapID
+		local mapID =
+			(self.rewardScanDiscoveredQuestIDs and self.rewardScanDiscoveredQuestIDs[id])
+			or (self.questList[id] and self.questList[id].scanMapID)
 		table.insert(self.activeTasks, { id = id, type = "WORLD_QUEST", mapId = mapID })
 	end
 	for id in pairs(activeMissions) do
@@ -1778,7 +1928,19 @@ function WQA:CheckWQ(mode)
 	end
 	for poiId, mapIds in pairs(pois.active) do
 		for mapId in pairs(mapIds) do
-			table.insert(self.activeTasks, { id = poiId, mapId = mapId, type = "AREA_POI" })
+			local entry =
+				self.Criterias.AreaPoi.list[poiId]
+				and self.Criterias.AreaPoi.list[poiId][mapId]
+				or nil
+			table.insert(
+				self.activeTasks,
+				{
+					id = poiId,
+					mapId = mapId,
+					type = "AREA_POI",
+					expiresAt = entry and entry.expiresAt or nil
+				}
+			)
 		end
 	end
  
@@ -2186,6 +2348,7 @@ local REWARD_SCAN_SAFE_WINDOW_RETRY = 0.50
 -- Full refresh consistency safeguards.
 local FULL_SCAN_MAP_RETRY_LIMIT = 3
 local FULL_SCAN_MAP_RETRY_DELAY = 0.50
+local FULL_SCAN_MAP_VALIDATION_DELAY = 0.50
 local FULL_SCAN_REWARD_TIMEOUT = 15
 
 function WQA:IsQuestInteractionActive()
@@ -2336,19 +2499,22 @@ end
 function WQA:IsFullRefreshSnapshotComplete()
 	local unresolvedMaps = self:CountTableEntries(self.rewardScanUnresolvedMaps)
 	local unresolvedRewards = self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)
+	local unresolvedAreaPois = self:CountTableEntries(self.areaPoiUnresolved)
 	local pendingRewards = self:CountTableEntries(self.pendingQuests)
 
 	return unresolvedMaps == 0
 		and unresolvedRewards == 0
+		and unresolvedAreaPois == 0
 		and pendingRewards == 0
 		and self.rewards == true
 		and self.emissaryRewards == true,
 		unresolvedMaps,
 		unresolvedRewards,
-		pendingRewards
+		pendingRewards,
+		unresolvedAreaPois
 end
 
-function WQA:AbortIncompleteFullRefresh(unresolvedMaps, unresolvedRewards, pendingRewards)
+function WQA:AbortIncompleteFullRefresh(unresolvedMaps, unresolvedRewards, pendingRewards, unresolvedAreaPois)
 	if self.rewardScanTimer then
 		self:CancelTimer(self.rewardScanTimer)
 		self.rewardScanTimer = nil
@@ -2379,6 +2545,8 @@ function WQA:AbortIncompleteFullRefresh(unresolvedMaps, unresolvedRewards, pendi
 	self.fullRefreshExplicitlyRequested = false
 	self.pendingSafeDiscoveryMode = nil
 	self.rewardContinuationMode = nil
+	self.areaPoiExpectedActive = nil
+	self.areaPoiPreviousActiveEntries = nil
 
 	self:RefreshVisibleTaskList()
 	self:UpdateLDBText(next(self.activeTasks or {}), next(self.newTasks or {}))
@@ -2386,6 +2554,7 @@ function WQA:AbortIncompleteFullRefresh(unresolvedMaps, unresolvedRewards, pendi
 	print(
 		"|cff33ff99WQAW:|r Full refresh incomplete. Blizzard data was unavailable "
 			.. "(maps: " .. tostring(unresolvedMaps)
+			.. ", area POIs: " .. tostring(unresolvedAreaPois or 0)
 			.. ", rewards: " .. tostring(unresolvedRewards)
 			.. ", pending: " .. tostring(pendingRewards)
 			.. "). Previous list retained."
@@ -2670,82 +2839,129 @@ function WQA:ProcessRewardScanStep()
 	end
 
 	local mapID = self.rewardScanMaps and self.rewardScanMaps[self.rewardScanMapIndex]
-	if mapID then
-		local quests = C_TaskQuest.GetQuestsOnMap(mapID)
-		local accumulated = self.rewardScanMapAccumulatedQuests[mapID] or {}
-		self.rewardScanMapAccumulatedQuests[mapID] = accumulated
-
-		if quests then
-			for _, quest in ipairs(quests) do
-				if quest and quest.questID then
-					accumulated[quest.questID] = quest
-				end
-			end
+	if not mapID then
+		-- The first pass is intentionally discovery-only. It warms Blizzard's
+		-- task data for every enabled map before any map is considered complete.
+		-- This protects newly active quests that are omitted from the first
+		-- GetQuestsOnMap() call but appear on a subsequent call moments later.
+		if self.rewardScanMapPass == 1 then
+			self.rewardScanMapPass = 2
+			self.rewardScanMapIndex = 1
+			self:Debug('World quest discovery warm-up pass complete; starting validation pass')
+			self:ExitSilentBuildState(enteredSilentBuildState, false)
+			self:ScheduleRewardScanStep(FULL_SCAN_MAP_VALIDATION_DELAY)
+			return
 		end
 
-		local previous = self.rewardScanPreviousActiveQuestsByMap[mapID]
-		local missingPrevious = 0
-		if previous then
-			for questID in pairs(previous) do
-				if not accumulated[questID] then
-					missingPrevious = missingPrevious + 1
-				end
-			end
-		end
-
-		local suspicious = missingPrevious > 0
-		if suspicious then
-			local attempts = (self.rewardScanMapRetryCounts[mapID] or 0) + 1
-			self.rewardScanMapRetryCounts[mapID] = attempts
-			self.rewardScanMapRetries = (self.rewardScanMapRetries or 0) + 1
-
-			self:Debug(
-				"Retrying map quest data",
-				mapID,
-				"attempt=" .. tostring(attempts),
-				"nil=" .. tostring(quests == nil),
-				"missingPrevious=" .. tostring(missingPrevious)
-			)
-
-			if attempts < FULL_SCAN_MAP_RETRY_LIMIT then
-				self:ExitSilentBuildState(enteredSilentBuildState, false)
-				self:ScheduleRewardScanStep(FULL_SCAN_MAP_RETRY_DELAY)
-				return
-			end
-
-			if missingPrevious > 0 then
-				self.rewardScanUnresolvedMaps[mapID] = true
-				self:Debug("Map still missing previously active quests after retries", mapID)
-			end
-		end
-
-		local acceptedQuests = {}
-		for _, quest in pairs(accumulated) do
-			table.insert(acceptedQuests, quest)
-		end
-
-		self.rewardScanMapAccumulatedQuests[mapID] = nil
-		self.rewardScanMapIndex = self.rewardScanMapIndex + 1
-		self.rewardScanMapsProcessed = (self.rewardScanMapsProcessed or 0) + 1
-		self.rewardScanCurrentMapID = mapID
-		self.rewardScanCurrentQuests = acceptedQuests
-		self.rewardScanQuestIndex = 1
-
-		self:ExitSilentBuildState(enteredSilentBuildState, false)
-
-		if #self.rewardScanCurrentQuests > 0 then
-			self:ScheduleRewardScanStep(REWARD_SCAN_QUEST_INTERVAL)
-		else
-			self.rewardScanCurrentQuests = nil
-			self.rewardScanCurrentMapID = nil
-			self.rewardScanQuestIndex = nil
-			self:ScheduleRewardScanStep(REWARD_SCAN_MAP_INTERVAL)
-		end
+		self:FinishRewardDiscoveryScan()
+		self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 		return
 	end
 
-	self:FinishRewardDiscoveryScan()
-	self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
+	local quests = C_TaskQuest.GetQuestsOnMap(mapID)
+	local accumulated = self.rewardScanMapAccumulatedQuests[mapID] or {}
+	self.rewardScanMapAccumulatedQuests[mapID] = accumulated
+
+	local sampleIDs = {}
+	if quests then
+		for _, quest in ipairs(quests) do
+			if quest and quest.questID then
+				sampleIDs[quest.questID] = true
+				accumulated[quest.questID] = quest
+				self.rewardScanDiscoveredQuestIDs[quest.questID] = mapID
+			end
+		end
+	end
+
+	self.rewardScanMapSampleCounts[mapID] = (self.rewardScanMapSampleCounts[mapID] or 0) + 1
+	local sampleCount = self.rewardScanMapSampleCounts[mapID]
+
+	if self.rewardScanMapPass == 1 then
+		self.rewardScanMapFirstSamples[mapID] = sampleIDs
+		self.rewardScanMapFirstSampleWasNil[mapID] = quests == nil
+		self.rewardScanMapIndex = self.rewardScanMapIndex + 1
+		self:ExitSilentBuildState(enteredSilentBuildState, false)
+		self:ScheduleRewardScanStep(REWARD_SCAN_MAP_INTERVAL)
+		return
+	end
+
+	local firstSample = self.rewardScanMapFirstSamples[mapID] or {}
+	local samplesDiffer = false
+	for questID in pairs(firstSample) do
+		if not sampleIDs[questID] then
+			samplesDiffer = true
+			break
+		end
+	end
+	if not samplesDiffer then
+		for questID in pairs(sampleIDs) do
+			if not firstSample[questID] then
+				samplesDiffer = true
+				break
+			end
+		end
+	end
+
+	local previous = self.rewardScanPreviousActiveQuestsByMap[mapID]
+	local missingPrevious = 0
+	if previous then
+		for questID in pairs(previous) do
+			if not accumulated[questID] then
+				missingPrevious = missingPrevious + 1
+			end
+		end
+	end
+
+	-- Two samples are always taken. If they disagree, or a previously active
+	-- quest is still absent, take one final sample and union all observations.
+	local suspicious = samplesDiffer or missingPrevious > 0
+	if suspicious and sampleCount < FULL_SCAN_MAP_RETRY_LIMIT then
+		self.rewardScanMapRetries = (self.rewardScanMapRetries or 0) + 1
+		self.rewardScanMapRetryCounts[mapID] = (self.rewardScanMapRetryCounts[mapID] or 0) + 1
+
+		self:Debug(
+			'Retrying inconsistent map quest data',
+			mapID,
+			'sample=' .. tostring(sampleCount),
+			'nil=' .. tostring(quests == nil),
+			'samplesDiffer=' .. tostring(samplesDiffer),
+			'missingPrevious=' .. tostring(missingPrevious)
+		)
+
+		self:ExitSilentBuildState(enteredSilentBuildState, false)
+		self:ScheduleRewardScanStep(FULL_SCAN_MAP_RETRY_DELAY)
+		return
+	end
+
+	if missingPrevious > 0 then
+		self.rewardScanUnresolvedMaps[mapID] = true
+		self:Debug('Map still missing previously active quests after validation', mapID)
+	end
+
+	local acceptedQuests = {}
+	for _, quest in pairs(accumulated) do
+		table.insert(acceptedQuests, quest)
+	end
+
+	self.rewardScanMapAccumulatedQuests[mapID] = nil
+	self.rewardScanMapFirstSamples[mapID] = nil
+	self.rewardScanMapFirstSampleWasNil[mapID] = nil
+	self.rewardScanMapIndex = self.rewardScanMapIndex + 1
+	self.rewardScanMapsProcessed = (self.rewardScanMapsProcessed or 0) + 1
+	self.rewardScanCurrentMapID = mapID
+	self.rewardScanCurrentQuests = acceptedQuests
+	self.rewardScanQuestIndex = 1
+
+	self:ExitSilentBuildState(enteredSilentBuildState, false)
+
+	if #self.rewardScanCurrentQuests > 0 then
+		self:ScheduleRewardScanStep(REWARD_SCAN_QUEST_INTERVAL)
+	else
+		self.rewardScanCurrentQuests = nil
+		self.rewardScanCurrentMapID = nil
+		self.rewardScanQuestIndex = nil
+		self:ScheduleRewardScanStep(REWARD_SCAN_MAP_INTERVAL)
+	end
 end
 
 function WQA:Reward()
@@ -2779,6 +2995,7 @@ function WQA:Reward()
 	table.sort(self.rewardScanMaps)
 
 	self.rewardScanMapIndex = 1
+	self.rewardScanMapPass = 1
 	self.rewardScanCurrentMapID = nil
 	self.rewardScanCurrentQuests = nil
 	self.rewardScanQuestIndex = nil
@@ -2791,6 +3008,10 @@ function WQA:Reward()
 	self.rewardScanMapRetries = 0
 	self.rewardScanUnresolvedMaps = {}
 	self.rewardScanMapAccumulatedQuests = {}
+	self.rewardScanMapFirstSamples = {}
+	self.rewardScanMapFirstSampleWasNil = {}
+	self.rewardScanMapSampleCounts = {}
+	self.rewardScanDiscoveredQuestIDs = {}
 	self.rewardScanRewardPendingSince = {}
 	self.rewardScanUnresolvedRewardQuests = {}
 	self.rewardScanPreviousActiveQuestsByMap = {}

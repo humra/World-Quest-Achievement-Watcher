@@ -1,5 +1,10 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.1.2 - 2026-09-01
+
+Added safe retries and snapshot validation so previously valid quests are retained when data is unavailable. This should add to the consistency of data.
+Added a double-pass logic to assure Naigtal and Val quests are properly processed.
+
 ## 1.1.1 - 2026-09-01
 
 Full refresh should no longer be inconsistent in gathering data.

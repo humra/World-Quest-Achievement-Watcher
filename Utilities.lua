@@ -203,6 +203,14 @@ function WQA:GetTaskTime(task)
     elseif task.type == "MISSION" then
         return self:GetMissionTimeLeftMinutes(task.id)
     elseif task.type == "AREA_POI" then
+        -- Prefer the expiry captured by the last successful full scan. This
+        -- keeps display rendering stable even if Blizzard temporarily stops
+        -- returning the Area POI while the cached event is still active.
+        if type(task.expiresAt) == "number" then
+            local now = GetServerTime and GetServerTime() or time()
+            return math.max(0, task.expiresAt - now) / 60
+        end
+
         local schedulerInfo = self:GetScheduledAreaPoiInfo(task.id, task.mapId)
         if schedulerInfo and schedulerInfo.endTime then
             local now = GetServerTime and GetServerTime() or time()

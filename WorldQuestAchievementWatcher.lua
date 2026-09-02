@@ -304,6 +304,17 @@ function WQA:EnsureOptionsRegistered()
 	return true
 end
 
+local function MergeQuestIDSet(target, sourceSet)
+	if type(sourceSet) ~= "table" then
+		return target
+	end
+	target = target or {}
+	for questID in pairs(sourceSet) do
+		target[questID] = true
+	end
+	return target
+end
+
 function WQA:OnEnable()
 	local name, server = UnitFullName("player")
 	self.playerName = name .. "-" .. server
@@ -504,6 +515,8 @@ function WQA:slash(input)
 		print("Full refresh map-data retries: " .. tostring(self.rewardScanMapRetries or 0))
 		print("Full refresh unresolved maps: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedMaps)))
 		print("Full refresh unresolved reward quests: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)))
+		print("Full refresh reward preloads queued: " .. tostring(#(self.rewardPreloadQueue or {})))
+		print("Full refresh reward timeout clocks started: " .. tostring(self:CountTableEntries(self.rewardScanRewardFirstRequestedAt)))
 		print("Full refresh Area POI retries: " .. tostring(self.areaPoiConsistencyRetries or 0))
 		print("Full refresh unresolved Area POIs: " .. tostring(self:CountTableEntries(self.areaPoiUnresolved)))
 		print("World quest discovery paused for quest UI: " .. tostring(self.rewardScanPausedForQuestUI == true))
@@ -2473,9 +2486,15 @@ function WQA:ProcessRewardPreloadQueue()
 		and (force or not HaveQuestRewardData(questID))
 		and not SkipRewardDataPreloadQuests[questID]
 	then
+		local requestTime = GetTime and GetTime() or 0
+		self.rewardScanRewardFirstRequestedAt = self.rewardScanRewardFirstRequestedAt or {}
+		if not self.rewardScanRewardFirstRequestedAt[questID] then
+			self.rewardScanRewardFirstRequestedAt[questID] = requestTime
+		end
+
 		C_TaskQuest.RequestPreloadRewardData(questID)
 		self.rewardPreloadLastRequest = self.rewardPreloadLastRequest or {}
-		self.rewardPreloadLastRequest[questID] = GetTime and GetTime() or 0
+		self.rewardPreloadLastRequest[questID] = requestTime
 		self.rewardPreloadRequestsThisScan = (self.rewardPreloadRequestsThisScan or 0) + 1
 		self:Debug(
 			force and "Forced reward preload request" or "Reward preload request",
@@ -2586,13 +2605,16 @@ function WQA:ProcessPendingRewards()
 	local now = GetTime and GetTime() or 0
 
 	self.rewardScanRewardPendingSince = self.rewardScanRewardPendingSince or {}
+	self.rewardScanRewardFirstRequestedAt = self.rewardScanRewardFirstRequestedAt or {}
+	self.rewardScanRewardLocalRetrySince = self.rewardScanRewardLocalRetrySince or {}
 	self.rewardScanUnresolvedRewardQuests = self.rewardScanUnresolvedRewardQuests or {}
 
 	for questID, _ in pairs(self.pendingQuests or {}) do
 		local isEmissary = self.questList[questID] and self.questList[questID].isEmissary
 		local questNeedsRetry = false
+		local rewardDataReady = HaveQuestData(questID) and HaveQuestRewardData(questID)
 
-		if HaveQuestData(questID) and HaveQuestRewardData(questID) then
+		if rewardDataReady then
 			questNeedsRetry = self:CheckItems(questID, isEmissary)
 			if self:CheckCurrencies(questID, isEmissary) then
 				questNeedsRetry = true
@@ -2605,17 +2627,44 @@ function WQA:ProcessPendingRewards()
 		if not questNeedsRetry then
 			self.pendingQuests[questID] = nil
 			self.rewardScanRewardPendingSince[questID] = nil
+			self.rewardScanRewardFirstRequestedAt[questID] = nil
+			self.rewardScanRewardLocalRetrySince[questID] = nil
 		else
-			local firstPending = self.rewardScanRewardPendingSince[questID]
-			if not firstPending then
-				firstPending = now
-				self.rewardScanRewardPendingSince[questID] = firstPending
+			-- A quest that is merely waiting in WQAW's throttled preload queue
+			-- has not yet had a fair chance to resolve. Do not start or advance
+			-- its failure timeout until its own preload request was actually sent.
+			local firstRequestedAt = self.rewardScanRewardFirstRequestedAt[questID]
+			local queuedForPreload =
+				self.rewardPreloadQueued
+				and self.rewardPreloadQueued[questID] == true
+
+			local timeoutStartedAt = firstRequestedAt
+
+			if not timeoutStartedAt and rewardDataReady and not queuedForPreload then
+				-- Reward data itself is present, but item/link/equipment metadata
+				-- is still resolving. This path does not necessarily require a
+				-- RequestPreloadRewardData call, so give it its own local clock.
+				local localRetrySince = self.rewardScanRewardLocalRetrySince[questID]
+				if not localRetrySince then
+					localRetrySince = now
+					self.rewardScanRewardLocalRetrySince[questID] = localRetrySince
+				end
+				timeoutStartedAt = localRetrySince
 			end
 
-			if now - firstPending >= FULL_SCAN_REWARD_TIMEOUT then
+			-- Keep the old table populated for useful debug state, but it no
+			-- longer controls timeout semantics.
+			self.rewardScanRewardPendingSince[questID] =
+				timeoutStartedAt or self.rewardScanRewardPendingSince[questID]
+
+			if timeoutStartedAt and now - timeoutStartedAt >= FULL_SCAN_REWARD_TIMEOUT then
 				self.rewardScanUnresolvedRewardQuests[questID] = true
 				self.pendingQuests[questID] = nil
-				self:Debug("Reward data unresolved after timeout", questID)
+				self:Debug(
+					"Reward data unresolved after per-quest timeout",
+					questID,
+					"elapsed=" .. string.format("%.1f", now - timeoutStartedAt)
+				)
 			else
 				retry = true
 			end
@@ -3012,7 +3061,9 @@ function WQA:Reward()
 	self.rewardScanMapFirstSampleWasNil = {}
 	self.rewardScanMapSampleCounts = {}
 	self.rewardScanDiscoveredQuestIDs = {}
-	self.rewardScanRewardPendingSince = {}
+	self.rewardScanRewardPendingSince = {} -- legacy/debug compatibility
+	self.rewardScanRewardFirstRequestedAt = {}
+	self.rewardScanRewardLocalRetrySince = {}
 	self.rewardScanUnresolvedRewardQuests = {}
 	self.rewardScanPreviousActiveQuestsByMap = {}
 	self.rewardScanRawItemRewardCounts = {}
@@ -3175,17 +3226,6 @@ function WQA:GetAppearanceIDForTransmogSource(itemModifiedAppearanceID)
 		end
 	end
 	return nil
-end
-
-local function MergeQuestIDSet(target, sourceSet)
-	if type(sourceSet) ~= "table" then
-		return target
-	end
-	target = target or {}
-	for questID in pairs(sourceSet) do
-		target[questID] = true
-	end
-	return target
 end
 
 function WQA:GetTrackedTransmogQuestIDsForSource(itemModifiedAppearanceID)

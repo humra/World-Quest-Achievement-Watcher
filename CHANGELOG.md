@@ -1,5 +1,10 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.1.3 - 2026-09-02
+
+When there is a large amount of data to be processed the timers now work on a per-quest basis, this should reduce the frequency of the message "Blizzard data was unavailable" error message.
+Fixed an error where registering a transmog would try to read from a null value.
+
 ## 1.1.2 - 2026-09-01
 
 Added safe retries and snapshot validation so previously valid quests are retained when data is unavailable. This should add to the consistency of data.

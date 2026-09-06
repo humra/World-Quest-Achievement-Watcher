@@ -48,17 +48,17 @@ local questZoneIDList = {
 }
 
 function WQA:GetQuestZoneID(questID)
-    if WQA.questList[questID] and WQA.questList[questID].isEmissary then
+    local quest = WQA.questList[questID]
+    if quest and quest.isEmissary then
         return "Emissary"
     end
-    --if not WQA.questList[questID].info then	WQA.questList[questID].info = {} end
-    --if WQA.questList[questID].info.zoneID then
-    --	return WQA.questList[questID].info.zoneID
-    --else
-    --	WQA.questList[questID].info.zoneID = questZoneIDList[questID] or C_TaskQuest.GetQuestZoneID(questID)
-    --	return WQA.questList[questID].info.zoneID
-    --end
-    return questZoneIDList[questID] or C_TaskQuest.GetQuestZoneID(questID)
+
+    -- Prefer the map that actually returned the quest during the validated
+    -- full scan. Blizzard's separate zone lookup can temporarily return nil,
+    -- especially shortly after login.
+    return questZoneIDList[questID]
+        or (quest and quest.scanMapID)
+        or C_TaskQuest.GetQuestZoneID(questID)
 end
 
 function WQA:GetMissionZoneID(missionID)
@@ -81,22 +81,44 @@ end
 
 function WQA:GetMapInfo(mapID)
     if mapID then
-        return C_Map.GetMapInfo(mapID)
-    else
-        return { name = "Unknown" }
+        local mapInfo = C_Map.GetMapInfo(mapID)
+        if mapInfo then
+            return mapInfo
+        end
     end
+    return { name = "Unknown" }
 end
 
 function WQA:GetQuestZoneName(questID)
-    if WQA.questList[questID].isEmissary then
+    local quest = WQA.questList[questID]
+    if not quest then
+        return "Unknown"
+    end
+    if quest.isEmissary then
         return "Emissary"
     end
-    if not WQA.questList[questID].info then
-        WQA.questList[questID].info = {}
+
+    quest.info = quest.info or {}
+
+    -- Never keep "Unknown" as authoritative cached metadata. It is a display
+    -- fallback only; clearing it lets a later call resolve the real zone.
+    if quest.info.zoneName == "Unknown" or quest.info.zoneName == "" then
+        quest.info.zoneName = nil
     end
-    WQA.questList[questID].info.zoneName = WQA.questList[questID].info.zoneName or
-        self:GetMapInfo(self:GetQuestZoneID(questID)).name
-    return WQA.questList[questID].info.zoneName
+
+    if quest.info.zoneName then
+        return quest.info.zoneName
+    end
+
+    local zoneID = self:GetQuestZoneID(questID)
+    local mapInfo = zoneID and C_Map.GetMapInfo(zoneID) or nil
+    if mapInfo and mapInfo.name and mapInfo.name ~= "" then
+        quest.info.zoneName = mapInfo.name
+        return mapInfo.name
+    end
+
+    -- Temporary UI fallback only. Do not save this value into quest.info.
+    return "Unknown"
 end
 
 function WQA:GetMissionZoneName(missionID)

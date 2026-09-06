@@ -1,5 +1,10 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.1.4 - 2026-09-06
+
+Changed the scanning order to prevent cache-tainting on characters which already have data.
+Added a progress bar for full scans which can be turned on or off in the settings.
+
 ## 1.1.3 - 2026-09-02
 
 When there is a large amount of data to be processed the timers now work on a per-quest basis, this should reduce the frequency of the message "Blizzard data was unavailable" error message.

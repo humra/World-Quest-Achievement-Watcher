@@ -73,6 +73,7 @@ function WQA:OnInitialize()
 				popupRememberPosition = false,
 				popupX = 600,
 				popupY = 800,
+				showRefreshProgressBar = true,
 				zone = { ["*"] = true },
 				reward = {
 					gear = {
@@ -1029,7 +1030,10 @@ function WQA:SavePersistentDisplayCache()
 	local previousExpiry = {}
 	if type(previous) == "table" and type(previous.activeTasks) == "table" then
 		for _, task in ipairs(previous.activeTasks) do
-			if task.type == "WORLD_QUEST" and task.expiresAt then
+			if task.type == "WORLD_QUEST"
+				and type(task.expiresAt) == "number"
+				and task.expiresAt > now
+			then
 				previousExpiry[task.id] = task.expiresAt
 			end
 		end
@@ -1087,6 +1091,26 @@ function WQA:LoadPersistentDisplayCache()
 	end
 
 	self.questList = CopyPersistentValue(cache.questList) or {}
+
+	-- "Unknown" is only a temporary display fallback. Older/incomplete
+	-- snapshots could persist it into this character's display cache, which
+	-- prevented later calls from trying to resolve the real zone again.
+	-- Clear only that derived label; all user settings and useful cache data
+	-- remain intact.
+	for questID, questData in pairs(self.questList) do
+		if type(questData) == "table" and type(questData.info) == "table" then
+			if questData.info.zoneName == "Unknown" or questData.info.zoneName == "" then
+				questData.info.zoneName = nil
+				if type(cache.questList) == "table"
+					and type(cache.questList[questID]) == "table"
+					and type(cache.questList[questID].info) == "table"
+				then
+					cache.questList[questID].info.zoneName = nil
+				end
+			end
+		end
+	end
+
 	self.questPinList = CopyPersistentValue(cache.questPinList) or {}
 	self.questPinMapList = CopyPersistentValue(cache.questPinMapList) or {}
 	self.missionList = CopyPersistentValue(cache.missionList) or {}
@@ -1097,6 +1121,16 @@ function WQA:LoadPersistentDisplayCache()
 	self.activeTransmogAppearanceQuestIDs = CopyPersistentValue(cache.activeTransmogAppearanceQuestIDs) or {}
 	self.activeTransmogSourceQuestIDs = CopyPersistentValue(cache.activeTransmogSourceQuestIDs) or {}
 	self.activeTasks = CopyPersistentValue(cache.activeTasks) or {}
+
+	-- The committed task snapshot can also carry the map that originally
+	-- discovered a WQ. Recover that reliable map hint for older cached quests
+	-- before any display sorting/zone lookup occurs.
+	for _, task in ipairs(self.activeTasks) do
+		if task.type == "WORLD_QUEST" and task.mapId and self.questList[task.id] then
+			self.questList[task.id].scanMapID = self.questList[task.id].scanMapID or task.mapId
+		end
+	end
+
 	self.newTasks = {}
 	self.pendingQuests = {}
 	self.rewards = true
@@ -1202,10 +1236,13 @@ function WQA:BeginFullRefreshSettlingPeriod()
 			.. " seconds for Blizzard quest data to settle..."
 	)
 
+	self:StartFullRefreshProgressIndicator()
+
 	self.fullRefreshSettleTimer = self:ScheduleTimer(function()
 		self.fullRefreshSettleTimer = nil
 		self.fullRefreshSettling = false
 		self.fullRefreshSettlesAt = nil
+		self:StopFullRefreshProgressIndicator()
 		print("|cff33ff99WQAW:|r Full refresh finished.")
 	end, FULL_REFRESH_SETTLE_SECONDS)
 end
@@ -1234,6 +1271,7 @@ function WQA:RequestFullRefresh(reason, openWorldMap)
 	self.pendingSafeDiscoveryMode = "new"
 	self.fullRefreshExplicitlyRequested = true
 	self.lastSafeWindowReason = reason
+	self:StartFullRefreshProgressIndicator()
 
 	-- These events are used only while an explicit full refresh is pending.
 	-- If the scan pauses because the player opens quest/gossip UI, closing that
@@ -1472,6 +1510,214 @@ function WQA:GetLastFullScanStatusText()
 		return string.format("Last full scan: %dd %dh ago", days, remainderHours)
 	end
 	return string.format("Last full scan: %dd ago", days)
+end
+
+
+function WQA:IsFullRefreshProgressActive()
+	return self.fullRefreshProgressTimer ~= nil
+		or self.fullRefreshExplicitlyRequested == true
+		or self.fullRefreshSettling == true
+end
+
+function WQA:GetFullRefreshProgress()
+	if self.fullRefreshSettling then
+		return 100
+	end
+
+	local totalMaps = self.rewardScanMaps and #self.rewardScanMaps or 0
+	if self.rewardScanInProgress and totalMaps > 0 then
+		local pass = self.rewardScanMapPass or 1
+
+		if pass <= 1 then
+			local completed = math.max(0, math.min(totalMaps, (self.rewardScanMapIndex or 1) - 1))
+			return math.floor((completed / totalMaps) * 50 + 0.5)
+		end
+
+		local completed = math.max(0, math.min(totalMaps, self.rewardScanMapsProcessed or 0))
+		return 50 + math.floor((completed / totalMaps) * 40 + 0.5)
+	end
+
+	if self.backgroundScanInProgress then
+		local pendingCount = self:CountTableEntries(self.pendingQuests)
+		local queuedCount = #(self.rewardPreloadQueue or {})
+		if pendingCount > 0 or queuedCount > 0 or self.rewards ~= true or self.emissaryRewards ~= true then
+			return 92
+		end
+		return 96
+	end
+
+	if self.fullRefreshExplicitlyRequested then
+		return 2
+	end
+
+	return 0
+end
+
+function WQA:GetFullRefreshProgressText()
+	if self.fullRefreshSettling then
+		local remaining = 0
+		if self.fullRefreshSettlesAt and GetTime then
+			remaining = math.max(0, math.ceil(self.fullRefreshSettlesAt - GetTime()))
+		end
+		if remaining > 0 then
+			return "Refresh status: finishing (" .. tostring(remaining) .. "s)"
+		end
+		return "Refresh status: finishing..."
+	end
+
+	if not self:IsFullRefreshProgressActive() then
+		return nil
+	end
+
+	if self:IsQuestInteractionActive() then
+		return "Refresh status: paused for quest interaction"
+	end
+
+	if self.deferredShowMode and UnitAffectingCombat and UnitAffectingCombat("player") then
+		return "Refresh status: waiting for combat to end"
+	end
+
+	if self.rewardScanInProgress then
+		local totalMaps = self.rewardScanMaps and #self.rewardScanMaps or 0
+		local pass = self.rewardScanMapPass or 1
+
+		if totalMaps > 0 then
+			if pass <= 1 then
+				local completed = math.max(0, math.min(totalMaps, (self.rewardScanMapIndex or 1) - 1))
+				return string.format(
+					"Refresh status: scanning maps %d/%d (pass 1/2)",
+					completed,
+					totalMaps
+				)
+			end
+
+			local completed = math.max(0, math.min(totalMaps, self.rewardScanMapsProcessed or 0))
+			return string.format(
+				"Refresh status: scanning maps %d/%d (pass 2/2)",
+				completed,
+				totalMaps
+			)
+		end
+
+		return "Refresh status: scanning maps..."
+	end
+
+	if self.backgroundScanInProgress then
+		local pendingCount = self:CountTableEntries(self.pendingQuests)
+		local queuedCount = #(self.rewardPreloadQueue or {})
+
+		if pendingCount > 0 or queuedCount > 0 or self.rewards ~= true or self.emissaryRewards ~= true then
+			return string.format(
+				"Refresh status: loading rewards (%d pending)",
+				pendingCount
+			)
+		end
+
+		return "Refresh status: finalizing..."
+	end
+
+	if self.fullRefreshExplicitlyRequested then
+		return "Refresh status: starting..."
+	end
+
+	return nil
+end
+
+function WQA:EnsureFullRefreshProgressFrame()
+	if self.fullRefreshProgressFrame then
+		return self.fullRefreshProgressFrame
+	end
+
+	local frame = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
+	frame:SetSize(330, 30)
+	frame:SetPoint("TOP", UIParent, "TOP", 0, -115)
+	frame:SetFrameStrata("DIALOG")
+	frame:SetBackdrop({
+		bgFile = "Interface\\Buttons\\WHITE8X8",
+		edgeFile = "Interface\\Buttons\\WHITE8X8",
+		edgeSize = 1
+	})
+	frame:SetBackdropColor(0, 0, 0, 0.82)
+	frame:SetBackdropBorderColor(0.35, 0.35, 0.35, 1)
+
+	local bar = CreateFrame("StatusBar", nil, frame)
+	bar:SetPoint("TOPLEFT", frame, "TOPLEFT", 4, -4)
+	bar:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -4, 4)
+	bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+	bar:SetMinMaxValues(0, 100)
+	bar:SetValue(0)
+	bar:SetStatusBarColor(0.20, 0.65, 1.00, 0.75)
+
+	local text = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	text:SetPoint("CENTER", bar, "CENTER", 0, 0)
+	text:SetJustifyH("CENTER")
+
+	frame.bar = bar
+	frame.text = text
+	frame:Hide()
+
+	self.fullRefreshProgressFrame = frame
+	return frame
+end
+
+function WQA:UpdateFullRefreshProgressIndicator()
+	local text = self:GetFullRefreshProgressText()
+	local active = text ~= nil
+	local showProgressBar =
+		self.db
+		and self.db.profile
+		and self.db.profile.options
+		and self.db.profile.options.showRefreshProgressBar ~= false
+
+	local frame = self.fullRefreshProgressFrame
+	if showProgressBar and active then
+		frame = frame or self:EnsureFullRefreshProgressFrame()
+		frame.bar:SetValue(self:GetFullRefreshProgress())
+		frame.text:SetText(text)
+		frame:Show()
+	elseif frame then
+		frame:Hide()
+	end
+
+	if self.PopUp and self.PopUp.RefreshButton then
+		if active then
+			if self.fullRefreshSettling then
+				self.PopUp.RefreshButton:SetText("Finishing...")
+			else
+				self.PopUp.RefreshButton:SetText("Refreshing...")
+			end
+			self.PopUp.RefreshButton:Disable()
+		else
+			self.PopUp.RefreshButton:SetText("Refresh")
+			self.PopUp.RefreshButton:Enable()
+		end
+	end
+
+	-- Keep an already-open minimap tooltip or popup status line current without
+	-- touching the in-progress scan snapshot.
+	if self.tooltip then
+		self:RefreshVisibleTaskList()
+	end
+end
+
+function WQA:StartFullRefreshProgressIndicator()
+	if self.fullRefreshProgressTimer then
+		self:UpdateFullRefreshProgressIndicator()
+		return
+	end
+
+	self:UpdateFullRefreshProgressIndicator()
+	self.fullRefreshProgressTimer = self:ScheduleRepeatingTimer(function()
+		self:UpdateFullRefreshProgressIndicator()
+	end, 0.5)
+end
+
+function WQA:StopFullRefreshProgressIndicator()
+	if self.fullRefreshProgressTimer then
+		self:CancelTimer(self.fullRefreshProgressTimer)
+		self.fullRefreshProgressTimer = nil
+	end
+	self:UpdateFullRefreshProgressIndicator()
 end
 
 function WQA:ScheduleNextCachedWorldQuestExpiry()
@@ -2567,6 +2813,7 @@ function WQA:AbortIncompleteFullRefresh(unresolvedMaps, unresolvedRewards, pendi
 	self.areaPoiExpectedActive = nil
 	self.areaPoiPreviousActiveEntries = nil
 
+	self:StopFullRefreshProgressIndicator()
 	self:RefreshVisibleTaskList()
 	self:UpdateLDBText(next(self.activeTasks or {}), next(self.newTasks or {}))
 
@@ -2706,7 +2953,7 @@ function WQA:ProcessRewardQuest(mapID, questID)
 		self.questList[questID] = nil
 	end
 
-	local questZoneID = C_TaskQuest.GetQuestZoneID(questID)
+	local questZoneID = C_TaskQuest.GetQuestZoneID(questID) or mapID
 	if
 		self.db.profile.options.zone[questZoneID] == true and
 		self.db.profile.options.reward.general.worldQuestType[worldQuestType]
@@ -3075,7 +3322,8 @@ function WQA:Reward()
 	if previousState and type(previousState.activeTasks) == "table" then
 		for _, task in ipairs(previousState.activeTasks) do
 			if task.type == "WORLD_QUEST"
-				and (not task.expiresAt or task.expiresAt > now)
+				and type(task.expiresAt) == "number"
+				and task.expiresAt > now
 			then
 				local previousQuest = previousState.questList and previousState.questList[task.id]
 				local mapID =

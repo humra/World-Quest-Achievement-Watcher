@@ -150,6 +150,10 @@ function WQA:UpdateQTip(tasks)
     tooltip:SetCell(1, tooltip:GetColumnCount(), _G.REWARDS)
     tooltip:AddSeparator()
 
+    local refreshStatus = self:GetFullRefreshProgressText()
+    if refreshStatus then
+        tooltip:AddLine(string.format("|cffffff00%s|r", refreshStatus))
+    end
     tooltip:AddLine(string.format("|cffaaaaaa%s|r", self:GetLastFullScanStatusText()))
     tooltip:AddSeparator()
 
@@ -631,6 +635,7 @@ function WQA:AnnouncePopUp(quests, silent)
             end
         )
         PopUp.RefreshButton = RefreshButton
+        WQA:UpdateFullRefreshProgressIndicator()
         --PopUp:SetPoint("TOPLEFT", self.db.profile.options.popupX, self.db.profile.options.popupY)
         PopUp:Hide()
 

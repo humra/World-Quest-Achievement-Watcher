@@ -920,6 +920,21 @@ function WQA:UpdateOptions()
 						end,
 						order = newOrder()
 					},
+					showRefreshProgressBar = {
+						type = "toggle",
+						name = "Show refresh progress bar",
+						desc = "Show the floating progress bar while a full World Quest refresh is running.",
+						width = "double",
+						set = function(info, val)
+							WQA.db.profile.options.showRefreshProgressBar = val
+							WQA:UpdateFullRefreshProgressIndicator()
+						end,
+						descStyle = "inline",
+						get = function()
+							return WQA.db.profile.options.showRefreshProgressBar
+						end,
+						order = newOrder()
+					},
 					refreshWorldQuests = {
 						type = "execute",
 						name = "Refresh World Quests",

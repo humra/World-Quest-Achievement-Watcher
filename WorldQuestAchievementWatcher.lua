@@ -509,6 +509,9 @@ function WQA:slash(input)
 		print("Reward preload queue: " .. tostring(self.rewardPreloadQueue and #self.rewardPreloadQueue or 0))
 		print("Reward preload requests this scan: " .. tostring(self.rewardPreloadRequestsThisScan or 0))
 		print("Reward preload paused for quest UI: " .. tostring(self.rewardPreloadPausedForQuestUI == true))
+		print("Reward preload paused for safe window: " .. tostring(self.rewardPreloadPausedForSafeWindow == true))
+		print("Reward preload timer active: " .. tostring(self.rewardPreloadTimer ~= nil))
+		print("Reward pending timer active: " .. tostring(self.rewardPendingPollTimer ~= nil))
 		print("World quest discovery scan active: " .. tostring(self.rewardScanInProgress == true))
 		print("World quest discovery maps: " .. tostring(self.rewardScanMapsProcessed or 0) .. "/" .. tostring(self.rewardScanMaps and #self.rewardScanMaps or 0))
 		print("World quest discovery quests processed: " .. tostring(self.rewardScanQuestsProcessed or 0))
@@ -516,6 +519,75 @@ function WQA:slash(input)
 		print("Full refresh map-data retries: " .. tostring(self.rewardScanMapRetries or 0))
 		print("Full refresh unresolved maps: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedMaps)))
 		print("Full refresh unresolved reward quests: " .. tostring(self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)))
+		print("Full refresh direct reward API fallbacks used: " .. tostring(self.rewardScanDirectRewardFallbackCount or 0))
+		print("Full refresh reward fallbacks used: " .. tostring(self.rewardScanRewardFallbackCount or 0))
+		print("Full refresh previous quest fallbacks used: " .. tostring(self.rewardScanPreviousQuestFallbackCount or 0))
+
+		local playerMapID = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player") or nil
+		local playerMapInfo = playerMapID and C_Map and C_Map.GetMapInfo and C_Map.GetMapInfo(playerMapID) or nil
+		local playerParentMapID = playerMapInfo and playerMapInfo.parentMapID or nil
+		local playerParentInfo = playerParentMapID and C_Map and C_Map.GetMapInfo and C_Map.GetMapInfo(playerParentMapID) or nil
+		print(
+			"Player map: "
+				.. tostring(playerMapID or "unknown")
+				.. " | "
+				.. tostring(playerMapInfo and playerMapInfo.name or "unknown")
+				.. " | type="
+				.. tostring(playerMapInfo and playerMapInfo.mapType or "unknown")
+				.. " | parent="
+				.. tostring(playerParentMapID or "none")
+				.. " ("
+				.. tostring(playerParentInfo and playerParentInfo.name or "none")
+				.. ")"
+		)
+
+		if IsInInstance then
+			local inInstance, instanceType = IsInInstance()
+			print("Player instance state: " .. tostring(inInstance) .. " | type=" .. tostring(instanceType or "none"))
+		end
+
+		for mapID in pairs(self.rewardScanUnresolvedMaps or {}) do
+			local mapInfo = C_Map and C_Map.GetMapInfo and C_Map.GetMapInfo(mapID) or nil
+			print(
+				"Unresolved map: "
+					.. tostring(mapID)
+					.. " | "
+					.. tostring(mapInfo and mapInfo.name or "unknown")
+					.. " | parent="
+					.. tostring(mapInfo and mapInfo.parentMapID or "none")
+			)
+
+			local missingQuestIDs = self.rewardScanUnresolvedMapQuestIDs and self.rewardScanUnresolvedMapQuestIDs[mapID]
+			for questID in pairs(missingQuestIDs or {}) do
+				local title =
+					(C_TaskQuest and C_TaskQuest.GetQuestInfoByQuestID and C_TaskQuest.GetQuestInfoByQuestID(questID))
+					or (GetTitleForQuestID and GetTitleForQuestID(questID))
+					or "unknown"
+				print("  Missing previous quest: " .. tostring(questID) .. " | " .. tostring(title))
+			end
+		end
+
+		for questID in pairs(self.rewardScanUnresolvedRewardQuests or {}) do
+			local title =
+				(C_TaskQuest and C_TaskQuest.GetQuestInfoByQuestID and C_TaskQuest.GetQuestInfoByQuestID(questID))
+				or (GetTitleForQuestID and GetTitleForQuestID(questID))
+				or "unknown"
+			local mapID =
+				(self.rewardScanDiscoveredQuestIDs and self.rewardScanDiscoveredQuestIDs[questID])
+				or (C_TaskQuest and C_TaskQuest.GetQuestZoneID and C_TaskQuest.GetQuestZoneID(questID))
+			local mapInfo = mapID and C_Map and C_Map.GetMapInfo and C_Map.GetMapInfo(mapID) or nil
+			print(
+				"Unresolved reward quest: "
+					.. tostring(questID)
+					.. " | "
+					.. tostring(title)
+					.. " | map="
+					.. tostring(mapID or "unknown")
+					.. " ("
+					.. tostring(mapInfo and mapInfo.name or "unknown")
+					.. ")"
+			)
+		end
 		print("Full refresh reward preloads queued: " .. tostring(#(self.rewardPreloadQueue or {})))
 		print("Full refresh reward timeout clocks started: " .. tostring(self:CountTableEntries(self.rewardScanRewardFirstRequestedAt)))
 		print("Full refresh Area POI retries: " .. tostring(self.areaPoiConsistencyRetries or 0))
@@ -670,11 +742,54 @@ function WQA:SeedExpectedAreaPoiRegistrations()
 				self.Criterias.AreaPoi.list[poiID] = self.Criterias.AreaPoi.list[poiID] or {}
 
 				if not self.Criterias.AreaPoi.list[poiID][mapID] then
-					self.Criterias.AreaPoi.list[poiID][mapID] = CloneConsistencyValue(previousEntry)
-					self.Criterias.AreaPoi.list[poiID][mapID]._wqawConsistencyFallback = true
+					local fallbackEntry = CloneConsistencyValue(previousEntry)
+					local achievementRewards =
+						fallbackEntry.reward
+						and fallbackEntry.reward.achievement
+						or nil
+
+					if type(achievementRewards) == "table"
+						and self.Achievements
+						and self.Achievements.ShouldKeepCachedRotatingAchievement
+					then
+						for index = #achievementRewards, 1, -1 do
+							local reward = achievementRewards[index]
+							local keep = reward
+								and reward.id
+								and self.Achievements:ShouldKeepCachedRotatingAchievement(
+									reward.id,
+									mapID
+								)
+								or nil
+
+							if keep == false then
+								self:Debug(
+									"Removing stale cached rotating achievement",
+									reward and reward.id,
+									poiID,
+									mapID
+								)
+								table.remove(achievementRewards, index)
+							end
+						end
+
+						if #achievementRewards == 0 then
+							fallbackEntry.reward.achievement = nil
+						end
+					end
+
+					-- If revalidation removed the only tracked reward, do not
+					-- resurrect a bare Area POI solely because it existed in the
+					-- previous snapshot.
+					if fallbackEntry.reward and next(fallbackEntry.reward) then
+						self.Criterias.AreaPoi.list[poiID][mapID] = fallbackEntry
+						self.Criterias.AreaPoi.list[poiID][mapID]._wqawConsistencyFallback = true
+					end
 				end
 
-				self.Criterias.AreaPoi.list[poiID][mapID]._wqawExpectedUntil = expectedUntil
+				if self.Criterias.AreaPoi.list[poiID][mapID] then
+					self.Criterias.AreaPoi.list[poiID][mapID]._wqawExpectedUntil = expectedUntil
+				end
 			end
 		end
 	end
@@ -1384,6 +1499,18 @@ function WQA:FinishBackgroundScan(mode)
 	self.fullRefreshExplicitlyRequested = false
 
 	if completedExplicitFullRefresh then
+		local unresolvedRewardCount = self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)
+		if unresolvedRewardCount > 0 then
+			-- Individual reward lookups are best-effort and no longer invalidate a
+			-- successful full refresh. Keep the details in /wqaw debug instead of
+			-- printing a non-actionable warning after every otherwise-good scan.
+			self:Debug(
+				"Full refresh completed with unresolved reward data",
+				unresolvedRewardCount,
+				"previous fallbacks=" .. tostring(self.rewardScanRewardFallbackCount or 0)
+			)
+		end
+
 		local now = GetServerTime and GetServerTime() or time()
 		self.worldQuestFullScanCompletedAt = now
 
@@ -1663,6 +1790,14 @@ end
 function WQA:UpdateFullRefreshProgressIndicator()
 	local text = self:GetFullRefreshProgressText()
 	local active = text ~= nil
+
+	-- The progress timer also acts as a lightweight watchdog for an explicit
+	-- refresh. AceTimer callbacks are one-shot; if a worker ever returns while
+	-- the safe window is temporarily closed, no callback remains to resume it.
+	-- Re-arm missing workers here without doing any Blizzard API work directly.
+	if active and self.EnsureFullRefreshWorkersScheduled then
+		self:EnsureFullRefreshWorkersScheduled()
+	end
 	local showProgressBar =
 		self.db
 		and self.db.profile
@@ -2083,6 +2218,41 @@ function WQA:CheckWQ(mode)
 	local newQuests = {}
 	local retry = false
 	for questID, _ in pairs(self.questList) do
+		local questData = self.questList[questID]
+		local questMapID =
+			(self.rewardScanDiscoveredQuestIDs and self.rewardScanDiscoveredQuestIDs[questID])
+			or (questData and questData.scanMapID)
+
+		-- Abundance can be exposed as a task quest instead of an Area POI. Prune
+		-- completed per-location achievement rewards here as well, at the final
+		-- active-quest validation point, so a stale cache cannot bypass the
+		-- achievement-registration filter.
+		local achievementRewards =
+			questData
+			and questData.reward
+			and questData.reward.achievement
+			or nil
+
+		if questMapID
+			and type(achievementRewards) == "table"
+			and self.Achievements
+			and self.Achievements.PruneCompletedRotatingAchievementRewards
+		then
+			self.Achievements:PruneCompletedRotatingAchievementRewards(
+				achievementRewards,
+				questMapID
+			)
+
+			if #achievementRewards == 0 then
+				questData.reward.achievement = nil
+			end
+		end
+
+		local hasTrackedRewards =
+			questData
+			and type(questData.reward) == "table"
+			and next(questData.reward) ~= nil
+
 		-- During an explicit full refresh the accepted GetQuestsOnMap snapshot is
 		-- authoritative. Do not let a second, transient C_TaskQuest.IsActive()
 		-- answer remove a quest that the same refresh just discovered.
@@ -2092,8 +2262,11 @@ function WQA:CheckWQ(mode)
 			and self.rewardScanDiscoveredQuestIDs[questID] ~= nil
 
 		if
-			discoveredByFullScan or IsActive(questID) or self:EmissaryIsActive(questID) or
-			self:isQuestPinActive(questID) or self:IsQuestFlaggedCompleted(questID)
+			hasTrackedRewards
+			and (
+				discoveredByFullScan or IsActive(questID) or self:EmissaryIsActive(questID) or
+				self:isQuestPinActive(questID) or self:IsQuestFlaggedCompleted(questID)
+			)
 		then
 			local questLink = self:GetTaskLink({ id = questID, type = "WORLD_QUEST" })
 			local link
@@ -2610,6 +2783,39 @@ local FULL_SCAN_MAP_RETRY_DELAY = 0.50
 local FULL_SCAN_MAP_VALIDATION_DELAY = 0.50
 local FULL_SCAN_REWARD_TIMEOUT = 15
 
+function WQA:EnsureFullRefreshWorkersScheduled()
+	if not self.fullRefreshExplicitlyRequested or not self.backgroundScanInProgress then
+		return
+	end
+
+	if not self:IsSafeWorldQuestDiscoveryWindow() then
+		return
+	end
+
+	-- Map discovery has its own worker. Do not start pending-reward processing
+	-- until that discovery phase is complete.
+	if self.rewardScanInProgress then
+		if not self.rewardScanTimer then
+			self:ScheduleRewardScanStep(REWARD_SCAN_SAFE_WINDOW_RETRY)
+		end
+		return
+	end
+
+	if self.rewardPreloadQueue
+		and #self.rewardPreloadQueue > 0
+		and not self.rewardPreloadTimer
+	then
+		self:StartRewardPreloadQueue(0.05)
+	end
+
+	if self.pendingQuests
+		and next(self.pendingQuests) ~= nil
+		and not self.rewardPendingPollTimer
+	then
+		self:SchedulePendingRewardCheck(0.10)
+	end
+end
+
 function WQA:IsQuestInteractionActive()
 	if QuestFrame and QuestFrame.IsShown and QuestFrame:IsShown() then
 		return true
@@ -2708,6 +2914,9 @@ function WQA:ProcessRewardPreloadQueue()
 	end
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
 		self.rewardPreloadPausedForSafeWindow = true
+		-- The callback that entered this function has already cleared its timer.
+		-- Retry later instead of orphaning the remaining reward preload queue.
+		self:StartRewardPreloadQueue(REWARD_SCAN_SAFE_WINDOW_RETRY)
 		return
 	end
 	self.rewardPreloadPausedForSafeWindow = false
@@ -2761,6 +2970,177 @@ function WQA:CountTableEntries(tbl)
 	return count
 end
 
+-- HaveQuestRewardData() can remain false for some older world quests even
+-- after the quest-specific reward APIs already return usable data. Treat the
+-- concrete item/currency/gold snapshot as authoritative when it contains at
+-- least one reward, while still retrying truly empty/incomplete snapshots.
+function WQA:HasDirectRewardSnapshot(questID)
+	local itemCount =
+		self.rewardScanRawItemRewardCounts
+		and self.rewardScanRawItemRewardCounts[questID]
+		or 0
+	local currencyCount =
+		self.rewardScanRawCurrencyRewardCounts
+		and self.rewardScanRawCurrencyRewardCounts[questID]
+		or 0
+	local goldMoney =
+		self.rewardScanRawGoldRewardMoney
+		and self.rewardScanRawGoldRewardMoney[questID]
+		or 0
+
+	return (type(itemCount) == "number" and itemCount > 0)
+		or (type(currencyCount) == "number" and currencyCount > 0)
+		or (type(goldMoney) == "number" and goldMoney > 0)
+end
+
+function WQA:RecordDirectRewardFallback(questID)
+	self.rewardScanDirectRewardFallbackQuestIDs =
+		self.rewardScanDirectRewardFallbackQuestIDs or {}
+
+	if self.rewardScanDirectRewardFallbackQuestIDs[questID] then
+		return
+	end
+
+	self.rewardScanDirectRewardFallbackQuestIDs[questID] = true
+	self.rewardScanDirectRewardFallbackCount =
+		(self.rewardScanDirectRewardFallbackCount or 0) + 1
+end
+
+function WQA:RestorePreviousTransmogTrackingForQuest(questID)
+	local state = self.backgroundScanCommittedState
+	if not state then
+		return
+	end
+
+	for appearanceID, questIDs in pairs(state.activeTransmogAppearanceQuestIDs or {}) do
+		if questIDs[questID] then
+			self.activeTransmogAppearanceIDs = self.activeTransmogAppearanceIDs or {}
+			self.activeTransmogAppearanceQuestIDs = self.activeTransmogAppearanceQuestIDs or {}
+			self.activeTransmogAppearanceIDs[appearanceID] = true
+			self.activeTransmogAppearanceQuestIDs[appearanceID] =
+				self.activeTransmogAppearanceQuestIDs[appearanceID] or {}
+			self.activeTransmogAppearanceQuestIDs[appearanceID][questID] = true
+		end
+	end
+
+	for sourceID, questIDs in pairs(state.activeTransmogSourceQuestIDs or {}) do
+		if questIDs[questID] then
+			self.activeTransmogSourceIDs = self.activeTransmogSourceIDs or {}
+			self.activeTransmogSourceQuestIDs = self.activeTransmogSourceQuestIDs or {}
+			self.activeTransmogSourceIDs[sourceID] = true
+			self.activeTransmogSourceQuestIDs[sourceID] =
+				self.activeTransmogSourceQuestIDs[sourceID] or {}
+			self.activeTransmogSourceQuestIDs[sourceID][questID] = true
+		end
+	end
+end
+
+function WQA:RestorePreviousQuestFallback(questID, currentMapID)
+	local previous = self:GetPreviousCommittedQuestData(questID)
+	if not previous then
+		return false
+	end
+
+	local fallback = CloneConsistencyValue(previous)
+	local current = self.questList and self.questList[questID] or nil
+
+	-- Preserve anything that the current scan did manage to resolve and fill
+	-- only the missing fields/reward categories from the previous committed
+	-- snapshot.
+	if current then
+		fallback.reward = fallback.reward or {}
+		for key, value in pairs(current) do
+			if key == "reward" and type(value) == "table" then
+				for rewardType, rewardValue in pairs(value) do
+					fallback.reward[rewardType] = CloneConsistencyValue(rewardValue)
+				end
+			else
+				fallback[key] = CloneConsistencyValue(value)
+			end
+		end
+	end
+
+	fallback.scanMapID = currentMapID or fallback.scanMapID
+	self.questList[questID] = fallback
+	self:RestorePreviousTransmogTrackingForQuest(questID)
+	return true
+end
+
+function WQA:ApplyUnresolvedRewardFallbacks()
+	self.rewardScanRewardFallbackCount = 0
+
+	if not self.backgroundScanInProgress then
+		return 0
+	end
+
+	for questID in pairs(self.rewardScanUnresolvedRewardQuests or {}) do
+		local currentMapID =
+			self.rewardScanDiscoveredQuestIDs
+			and self.rewardScanDiscoveredQuestIDs[questID]
+			or nil
+		local activeNow = currentMapID ~= nil or self:EmissaryIsActive(questID)
+
+		if activeNow and self:RestorePreviousQuestFallback(questID, currentMapID) then
+			self.rewardScanRewardFallbackCount = self.rewardScanRewardFallbackCount + 1
+		end
+	end
+
+	return self.rewardScanRewardFallbackCount
+end
+
+function WQA:ApplyMissingPreviousWorldQuestFallbacks()
+	self.rewardScanPreviousQuestFallbackCount = 0
+
+	local state = self.backgroundScanCommittedState
+	if not state or type(state.activeTasks) ~= "table" then
+		return 0
+	end
+
+	local now = GetServerTime and GetServerTime() or time()
+
+	for _, task in ipairs(state.activeTasks) do
+		if task.type == "WORLD_QUEST"
+			and task.id
+			and type(task.expiresAt) == "number"
+			and task.expiresAt > now
+			and not (self.rewardScanDiscoveredQuestIDs and self.rewardScanDiscoveredQuestIDs[task.id])
+		then
+			local definitelyExpired = false
+			if C_TaskQuest.GetQuestTimeLeftMinutes then
+				local ok, minutesLeft = pcall(C_TaskQuest.GetQuestTimeLeftMinutes, task.id)
+				if ok and type(minutesLeft) == "number" and minutesLeft <= 0 then
+					definitelyExpired = true
+				end
+			end
+
+			if definitelyExpired then
+				self:Debug("Previously active world quest expired during full refresh", task.id)
+			else
+				local previous = self:GetPreviousCommittedQuestData(task.id)
+				local mapID =
+					task.mapId
+					or (previous and previous.scanMapID)
+					or C_TaskQuest.GetQuestZoneID(task.id)
+
+				if self:RestorePreviousQuestFallback(task.id, mapID) then
+					self.rewardScanDiscoveredQuestIDs = self.rewardScanDiscoveredQuestIDs or {}
+					self.rewardScanDiscoveredQuestIDs[task.id] = mapID
+					self.rewardScanPreviousQuestFallbackCount =
+						self.rewardScanPreviousQuestFallbackCount + 1
+					self:Debug(
+						"Preserved previously active world quest after Blizzard omitted it",
+						task.id,
+						"map=" .. tostring(mapID),
+						"expiresAt=" .. tostring(task.expiresAt)
+					)
+				end
+			end
+		end
+	end
+
+	return self.rewardScanPreviousQuestFallbackCount
+end
+
 function WQA:IsFullRefreshSnapshotComplete()
 	local unresolvedMaps = self:CountTableEntries(self.rewardScanUnresolvedMaps)
 	local unresolvedRewards = self:CountTableEntries(self.rewardScanUnresolvedRewardQuests)
@@ -2768,7 +3148,6 @@ function WQA:IsFullRefreshSnapshotComplete()
 	local pendingRewards = self:CountTableEntries(self.pendingQuests)
 
 	return unresolvedMaps == 0
-		and unresolvedRewards == 0
 		and unresolvedAreaPois == 0
 		and pendingRewards == 0
 		and self.rewards == true
@@ -2830,6 +3209,9 @@ end
 function WQA:ProcessPendingRewards()
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
 		self.rewardPendingPausedForSafeWindow = true
+		-- Pending-reward polling is also one-shot. Keep it armed while an explicit
+		-- refresh is temporarily paused so it resumes automatically afterwards.
+		self:SchedulePendingRewardCheck(REWARD_SCAN_SAFE_WINDOW_RETRY)
 		return
 	end
 	self.rewardPendingPausedForSafeWindow = false
@@ -2858,17 +3240,27 @@ function WQA:ProcessPendingRewards()
 
 	for questID, _ in pairs(self.pendingQuests or {}) do
 		local isEmissary = self.questList[questID] and self.questList[questID].isEmissary
-		local questNeedsRetry = false
-		local rewardDataReady = HaveQuestData(questID) and HaveQuestRewardData(questID)
+		local haveQuestData = HaveQuestData(questID)
+		local blizzardRewardReady = haveQuestData and HaveQuestRewardData(questID)
 
-		if rewardDataReady then
-			questNeedsRetry = self:CheckItems(questID, isEmissary)
-			if self:CheckCurrencies(questID, isEmissary) then
-				questNeedsRetry = true
-			end
-		else
+		-- Query the concrete reward APIs even when HaveQuestRewardData() is false.
+		-- Older Legion world quests can expose their item/currency/gold rewards
+		-- through these APIs while that readiness flag never flips to true.
+		local itemNeedsRetry = self:CheckItems(questID, isEmissary)
+		local currencyNeedsRetry = self:CheckCurrencies(questID, isEmissary)
+		local directRewardReady = self:HasDirectRewardSnapshot(questID)
+		local rewardDataReady = blizzardRewardReady
+			or directRewardReady
+			or SkipRewardDataPreloadQuests[questID] == true
+
+		if directRewardReady and not blizzardRewardReady then
+			self:RecordDirectRewardFallback(questID)
+		end
+
+		local questNeedsRetry = itemNeedsRetry or currencyNeedsRetry or not rewardDataReady
+
+		if not rewardDataReady and haveQuestData then
 			self:QueueRewardPreload(questID)
-			questNeedsRetry = true
 		end
 
 		if not questNeedsRetry then
@@ -2925,6 +3317,7 @@ function WQA:ProcessPendingRewards()
 		self:SchedulePendingRewardCheck(1)
 	else
 		self:StopRewardPreloadQueue()
+		self:ApplyUnresolvedRewardFallbacks()
 		self.rewards = true
 		self.emissaryRewards = true
 
@@ -2986,16 +3379,22 @@ function WQA:ProcessRewardQuest(mapID, questID)
 			end
 		end
 
-		local questNeedsRetry = false
-		if not SkipRewardDataPreloadQuests[questID] and HaveQuestData(questID) and not HaveQuestRewardData(questID) then
-			self:QueueRewardPreload(questID)
-			questNeedsRetry = true
+		local haveQuestData = HaveQuestData(questID)
+		local blizzardRewardReady = haveQuestData and HaveQuestRewardData(questID)
+		local itemNeedsRetry = self:CheckItems(questID)
+		local currencyNeedsRetry = self:CheckCurrencies(questID)
+		local directRewardReady = self:HasDirectRewardSnapshot(questID)
+		local rewardDataReady = blizzardRewardReady
+			or directRewardReady
+			or SkipRewardDataPreloadQuests[questID] == true
+
+		if directRewardReady and not blizzardRewardReady then
+			self:RecordDirectRewardFallback(questID)
 		end
 
-		if self:CheckItems(questID) then
-			questNeedsRetry = true
-		end
-		if self:CheckCurrencies(questID) then
+		local questNeedsRetry = itemNeedsRetry or currencyNeedsRetry
+		if haveQuestData and not rewardDataReady then
+			self:QueueRewardPreload(questID)
 			questNeedsRetry = true
 		end
 
@@ -3095,6 +3494,9 @@ function WQA:ProcessRewardScanStep()
 
 	if not self:IsSafeWorldQuestDiscoveryWindow() then
 		self.rewardScanPausedForSafeWindow = true
+		-- The map-scan callback is one-shot too. Re-arm it so closing a temporary
+		-- quest/detail interaction always continues the same explicit refresh.
+		self:ScheduleRewardScanStep(REWARD_SCAN_SAFE_WINDOW_RETRY)
 		return
 	end
 	self.rewardScanPausedForSafeWindow = false
@@ -3149,6 +3551,7 @@ function WQA:ProcessRewardScanStep()
 			return
 		end
 
+		self:ApplyMissingPreviousWorldQuestFallbacks()
 		self:FinishRewardDiscoveryScan()
 		self:ExitSilentBuildState(enteredSilentBuildState, not self.silentRefreshInProgress)
 		return
@@ -3208,9 +3611,12 @@ function WQA:ProcessRewardScanStep()
 		end
 	end
 
-	-- Two samples are always taken. If they disagree, or a previously active
-	-- quest is still absent, take one final sample and union all observations.
-	local suspicious = samplesDiffer or missingPrevious > 0
+	-- Two current samples are authoritative for map consistency. A quest from
+	-- the previous committed snapshot can legitimately expire or move between a
+	-- zone map and its parent continent map, so its absence alone must not make
+	-- the whole refresh fail. Previous active quests are reconciled once all
+	-- maps have been scanned.
+	local suspicious = samplesDiffer
 	if suspicious and sampleCount < FULL_SCAN_MAP_RETRY_LIMIT then
 		self.rewardScanMapRetries = (self.rewardScanMapRetries or 0) + 1
 		self.rewardScanMapRetryCounts[mapID] = (self.rewardScanMapRetryCounts[mapID] or 0) + 1
@@ -3230,8 +3636,11 @@ function WQA:ProcessRewardScanStep()
 	end
 
 	if missingPrevious > 0 then
-		self.rewardScanUnresolvedMaps[mapID] = true
-		self:Debug('Map still missing previously active quests after validation', mapID)
+		self:Debug(
+			'Map omitted previously active quests; deferring to end-of-scan fallback',
+			mapID,
+			'missing=' .. tostring(missingPrevious)
+		)
 	end
 
 	local acceptedQuests = {}
@@ -3303,6 +3712,7 @@ function WQA:Reward()
 	self.rewardScanMapRetryCounts = {}
 	self.rewardScanMapRetries = 0
 	self.rewardScanUnresolvedMaps = {}
+	self.rewardScanUnresolvedMapQuestIDs = {}
 	self.rewardScanMapAccumulatedQuests = {}
 	self.rewardScanMapFirstSamples = {}
 	self.rewardScanMapFirstSampleWasNil = {}
@@ -3312,6 +3722,10 @@ function WQA:Reward()
 	self.rewardScanRewardFirstRequestedAt = {}
 	self.rewardScanRewardLocalRetrySince = {}
 	self.rewardScanUnresolvedRewardQuests = {}
+	self.rewardScanDirectRewardFallbackQuestIDs = {}
+	self.rewardScanDirectRewardFallbackCount = 0
+	self.rewardScanRewardFallbackCount = 0
+	self.rewardScanPreviousQuestFallbackCount = 0
 	self.rewardScanPreviousActiveQuestsByMap = {}
 	self.rewardScanRawItemRewardCounts = {}
 	self.rewardScanRawCurrencyRewardCounts = {}

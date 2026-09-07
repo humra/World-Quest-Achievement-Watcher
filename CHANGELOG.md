@@ -1,5 +1,11 @@
 # World Quest Achievement Watcher Changelog
 
+## 1.1.5 - 2026-09-07
+
+Improved full-refresh reliability by preventing reward loading hangs.
+Added fallback handling for missing quest rewards.
+Fixed incorrect Abundance achievement entries appearing after the location criteria had already been completed.
+
 ## 1.1.4 - 2026-09-06
 
 Changed the scanning order to prevent cache-tainting on characters which already have data.

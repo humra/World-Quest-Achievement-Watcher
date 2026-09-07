@@ -2,9 +2,18 @@ local WQA = WorldQuestAchievementWatcher
 
 WQA.Achievements = {}
 
-local function IsAchievementCriteriaComplete(achievementID, criteriaIndex)
-    local _, _, completed, quantity, reqQuantity = GetAchievementCriteriaInfo(achievementID, criteriaIndex)
+local function SafeGetAchievementCriteriaInfo(achievementID, criteriaIndex)
+    local ok, criteriaString, criteriaType, completed, quantity, reqQuantity, charName, flags, assetID, quantityString, criteriaID, eligible, duration, elapsed =
+        pcall(GetAchievementCriteriaInfo, achievementID, criteriaIndex, true)
 
+    if not ok then
+        return nil
+    end
+
+    return criteriaString, criteriaType, completed, quantity, reqQuantity, charName, flags, assetID, quantityString, criteriaID, eligible, duration, elapsed
+end
+
+local function CriteriaValuesAreComplete(completed, quantity, reqQuantity)
     if completed then
         return true
     end
@@ -16,6 +25,40 @@ local function IsAchievementCriteriaComplete(achievementID, criteriaIndex)
     end
 
     return false
+end
+
+local function IsAchievementCriteriaComplete(achievementID, criteriaIndex)
+    local _, _, completed, quantity, reqQuantity = SafeGetAchievementCriteriaInfo(achievementID, criteriaIndex)
+    return CriteriaValuesAreComplete(completed, quantity, reqQuantity)
+end
+
+function WQA.Achievements:EnsureAchievementCriteriaAvailable()
+    -- Achievement criteria can be only partially populated even though
+    -- GetAchievementInfo() and achievement hyperlinks already work. Loading
+    -- Blizzard_AchievementUI forces the client to populate the same criteria
+    -- catalog used by the default achievement frame. Do this lazily, only when
+    -- rotating-event criteria actually need to be inspected.
+    if CanShowAchievementUI and not CanShowAchievementUI() then
+        return false
+    end
+
+    if C_AddOns and C_AddOns.IsAddOnLoaded then
+        local _, loaded = C_AddOns.IsAddOnLoaded("Blizzard_AchievementUI")
+        if loaded then
+            return true
+        end
+    end
+
+    if C_AddOns and C_AddOns.LoadAddOn then
+        pcall(C_AddOns.LoadAddOn, "Blizzard_AchievementUI")
+    end
+
+    if C_AddOns and C_AddOns.IsAddOnLoaded then
+        local loadedOrLoading, loaded = C_AddOns.IsAddOnLoaded("Blizzard_AchievementUI")
+        return loaded == true or loadedOrLoading == true
+    end
+
+    return true
 end
 
 function WQA.Achievements:Register(achievement, forced, forcedByMe)
@@ -180,13 +223,10 @@ local function EventNameMatches(name, patterns)
     return false
 end
 
-local function NamedCriterionNeedsProgress(achievementID, criterionName)
-    if not criterionName then
-        return true
-    end
-
+local function BuildNormalizedCriterionNames(criterionName)
     local rawNames = type(criterionName) == "table" and criterionName or { criterionName }
     local wantedNames = {}
+
     for _, rawName in ipairs(rawNames) do
         local normalized = NormalizeEventName(rawName)
         if normalized then
@@ -194,26 +234,339 @@ local function NamedCriterionNeedsProgress(achievementID, criterionName)
         end
     end
 
-    if #wantedNames == 0 then
-        return true
+    return wantedNames
+end
+
+local function CriterionNameMatches(normalizedCriteria, wantedNames)
+    if not normalizedCriteria then
+        return false
     end
 
-    for i = 1, GetAchievementNumCriteria(achievementID) do
-        local criteriaString = GetAchievementCriteriaInfo(achievementID, i)
-        local normalizedCriteria = NormalizeEventName(criteriaString)
-        if normalizedCriteria then
-            for _, wanted in ipairs(wantedNames) do
-                if string.find(normalizedCriteria, wanted, 1, true) or string.find(wanted, normalizedCriteria, 1, true) then
-                    return not IsAchievementCriteriaComplete(achievementID, i)
+    -- Prefer exact matches. The containment fallback is retained for criteria
+    -- whose text gains a progress prefix/suffix or minor Blizzard wording change.
+    for _, wanted in ipairs(wantedNames) do
+        if normalizedCriteria == wanted then
+            return true
+        end
+    end
+
+    for _, wanted in ipairs(wantedNames) do
+        if string.find(normalizedCriteria, wanted, 1, true)
+            or string.find(wanted, normalizedCriteria, 1, true)
+        then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function NamedCriterionNeedsProgress(achievementID, criterionName, scanSparseIndexes)
+    if not criterionName then
+        return nil, false
+    end
+
+    local wantedNames = BuildNormalizedCriterionNames(criterionName)
+    if #wantedNames == 0 then
+        return nil, false
+    end
+
+    local numCriteria = tonumber(GetAchievementNumCriteria(achievementID)) or 0
+    if numCriteria <= 0 then
+        return nil, false
+    end
+
+    local maxIndex = numCriteria
+    if scanSparseIndexes then
+        maxIndex = math.max(32, numCriteria * 8)
+    end
+
+    for i = 1, maxIndex do
+        local criteriaString, _, completed, quantity, reqQuantity, _, _, _, _, criteriaID =
+            SafeGetAchievementCriteriaInfo(achievementID, i)
+
+        if criteriaString ~= nil or criteriaID ~= nil then
+            local normalizedCriteria = NormalizeEventName(criteriaString)
+            if CriterionNameMatches(normalizedCriteria, wantedNames) then
+                return not CriteriaValuesAreComplete(completed, quantity, reqQuantity), true
+            end
+        end
+    end
+
+    return nil, false
+end
+
+local STRICT_LOCATION_ACHIEVEMENTS = {
+    [61943] = true, -- Abundance: Prosperous Plentitude!
+    [62325] = true, -- Abundance: Treasures Aplenty
+    [62326] = true, -- Abundance: Golden Opportunities
+    [62329] = true, -- Abundance: Squash the Competition
+    [62330] = true, -- Abundance: One Bite at a Time
+    [62331] = true  -- Abundance: Drops of Prosperity
+}
+
+local function IsStrictLocationAchievement(achievement, entry)
+    return achievement
+        and entry
+        and STRICT_LOCATION_ACHIEVEMENTS[achievement.id] == true
+        and entry.criterionName ~= nil
+end
+
+local function IsReadableTooltipText(value)
+    if type(value) ~= "string" then
+        return false
+    end
+
+    if issecretvalue and issecretvalue(value) then
+        return false
+    end
+
+    return true
+end
+
+local function TooltipTextHasAchievementCheckmark(text)
+    if not IsReadableTooltipText(text) then
+        return false
+    end
+
+    local lower = string.lower(text)
+    return string.find(lower, "achievementcompare-yellowcheckmark", 1, true) ~= nil
+        or string.find(lower, "achievementcompare-greencheckmark", 1, true) ~= nil
+        or string.find(lower, "common-icon-checkmark", 1, true) ~= nil
+        or string.find(lower, "checkmark", 1, true) ~= nil
+end
+
+local function NormalizeTooltipCriterionText(text)
+    if not IsReadableTooltipText(text) then
+        return nil
+    end
+
+    -- Keep the actual criterion wording, but remove formatting that the
+    -- achievement tooltip appends around it. The checkmark itself is inspected
+    -- separately from the raw text before this normalization.
+    text = string.gsub(text, "|c%x%x%x%x%x%x%x%x", "")
+    text = string.gsub(text, "|r", "")
+    text = string.gsub(text, "|A:[^|]-|a", "")
+    text = string.gsub(text, "|T.-|t", "")
+    return NormalizeEventName(text)
+end
+
+local function ScanTooltipDataForCriterion(data, wantedNames)
+    if type(data) ~= "table" or type(data.lines) ~= "table" then
+        return nil, false
+    end
+
+    local matchedIncomplete = false
+
+    for _, line in ipairs(data.lines) do
+        if type(line) == "table" then
+            for _, field in ipairs({ "leftText", "rightText" }) do
+                local rawText = line[field]
+                local normalizedText = NormalizeTooltipCriterionText(rawText)
+
+                if CriterionNameMatches(normalizedText, wantedNames) then
+                    -- This is the exact atlas Blizzard adds to completed criteria
+                    -- in the achievement hyperlink tooltip. If any tooltip source
+                    -- reports the location checked, completion wins immediately.
+                    if TooltipTextHasAchievementCheckmark(rawText) then
+                        return false, true
+                    end
+
+                    matchedIncomplete = true
                 end
             end
         end
     end
 
-    -- If Blizzard localizes or hides the criterion name differently, err on the
-    -- useful side and allow the active event to be shown rather than silently
-    -- missing a rare rotation.
-    return true
+    if matchedIncomplete then
+        return true, true
+    end
+
+    return nil, false
+end
+
+local function TooltipCriterionNeedsProgress(achievementID, criterionName)
+    if not criterionName or not C_TooltipInfo then
+        return nil, false
+    end
+
+    local wantedNames = BuildNormalizedCriterionNames(criterionName)
+    if #wantedNames == 0 then
+        return nil, false
+    end
+
+    local matchedIncomplete = false
+
+    -- First use the same hyperlink tooltip that the player sees when hovering
+    -- the achievement in WQAW. This avoids interpreting criteria indexes,
+    -- criteria-tree parents, asset IDs, or achievement-link bit masks ourselves.
+    if C_TooltipInfo.GetHyperlink then
+        local link = GetAchievementLink(achievementID)
+        if IsReadableTooltipText(link) then
+            local ok, data = pcall(C_TooltipInfo.GetHyperlink, link)
+            if ok and data then
+                local needsProgress, matched = ScanTooltipDataForCriterion(data, wantedNames)
+                if matched and not needsProgress then
+                    return false, true
+                elseif matched then
+                    matchedIncomplete = true
+                end
+            end
+        end
+    end
+
+    -- GetAchievementByID is a useful second representation of the same
+    -- Blizzard tooltip data and does not depend on the link string being cached.
+    if C_TooltipInfo.GetAchievementByID then
+        local ok, data = pcall(C_TooltipInfo.GetAchievementByID, achievementID)
+        if ok and data then
+            local needsProgress, matched = ScanTooltipDataForCriterion(data, wantedNames)
+            if matched and not needsProgress then
+                return false, true
+            elseif matched then
+                matchedIncomplete = true
+            end
+        end
+    end
+
+    if matchedIncomplete then
+        return true, true
+    end
+
+    return nil, false
+end
+
+function WQA.Achievements:RotatingEventEntryNeedsProgress(achievement, entry)
+    if not achievement or not entry then
+        return false, false
+    end
+
+    local strictPerLocation = IsStrictLocationAchievement(achievement, entry)
+
+    if strictPerLocation then
+        -- The tooltip is the authoritative source for Abundance. It is the same
+        -- data path that visibly produces the yellow checkmarks in the user's
+        -- achievement tooltip, so there is no index/asset mapping to guess.
+        local needsProgress, matched =
+            TooltipCriterionNeedsProgress(achievement.id, entry.criterionName)
+
+        if matched then
+            return needsProgress, true
+        end
+
+        -- If tooltip data is temporarily unavailable, do not show a possibly
+        -- completed Abundance criterion. A later refresh can safely add it.
+        WQA:Debug(
+            "Strict rotating-event tooltip criterion unavailable",
+            achievement.id,
+            entry.mapID,
+            entry.criterionName and tostring(entry.criterionName) or "nil"
+        )
+        return false, false
+    end
+
+    local needsProgress, matched =
+        NamedCriterionNeedsProgress(achievement.id, entry.criterionName, false)
+
+    if matched then
+        return needsProgress, true
+    end
+
+    -- Legacy rotating-event entries keep their previous useful-side fallback.
+    return true, true
+end
+
+local function EntryContainsMap(entry, mapID)
+    if not entry or not mapID then
+        return false
+    end
+
+    if entry.mapID == mapID then
+        return true
+    end
+
+    for _, candidateMapID in ipairs(entry.mapIDs or {}) do
+        if candidateMapID == mapID then
+            return true
+        end
+    end
+
+    return false
+end
+
+function WQA.Achievements:GetRotatingEventEntryForMap(achievementID, mapID)
+    for expansionID = 7, 12 do
+        local data = WQA.data[expansionID]
+        if data and type(data.achievements) == "table" then
+            for _, achievement in pairs(data.achievements) do
+                if achievement.id == achievementID
+                    and achievement.criteriaType == "ROTATING_EVENT"
+                then
+                    for _, entry in ipairs(achievement.criteria or {}) do
+                        if EntryContainsMap(entry, mapID) then
+                            return achievement, entry
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+function WQA.Achievements:ShouldKeepCachedRotatingAchievement(achievementID, mapID)
+    local achievement, entry =
+        self:GetRotatingEventEntryForMap(achievementID, mapID)
+
+    -- nil means this is not one of the strict per-location rotating rewards.
+    -- Leave legacy/non-Abundance cached rewards untouched.
+    if not achievement or not entry then
+        return nil
+    end
+
+    -- Only strict per-location Abundance rewards are revalidated here.
+    -- Other rotating events retain the existing cache behavior.
+    if not IsStrictLocationAchievement(achievement, entry) then
+        return nil
+    end
+
+    local needsProgress, matched =
+        self:RotatingEventEntryNeedsProgress(achievement, entry)
+
+    if not matched then
+        return false
+    end
+
+    return needsProgress == true
+end
+
+function WQA.Achievements:PruneCompletedRotatingAchievementRewards(achievementRewards, mapID)
+    if type(achievementRewards) ~= "table" then
+        return false
+    end
+
+    local changed = false
+
+    for index = #achievementRewards, 1, -1 do
+        local reward = achievementRewards[index]
+        local keep = reward
+            and reward.id
+            and self:ShouldKeepCachedRotatingAchievement(reward.id, mapID)
+            or nil
+
+        if keep == false then
+            WQA:Debug(
+                "Removing completed rotating achievement reward",
+                reward and reward.id,
+                mapID
+            )
+            table.remove(achievementRewards, index)
+            changed = true
+        end
+    end
+
+    return changed
 end
 
 local function AddRotatingEventMatches(entry, achievementID)
@@ -277,7 +630,10 @@ end
 
 function WQA.Achievements:Register_ROTATING_EVENT(achievement)
     for _, entry in ipairs(achievement.criteria or {}) do
-        if NamedCriterionNeedsProgress(achievement.id, entry.criterionName) then
+        local needsProgress =
+            self:RotatingEventEntryNeedsProgress(achievement, entry)
+
+        if needsProgress then
             AddRotatingEventMatches(entry, achievement.id)
         end
     end

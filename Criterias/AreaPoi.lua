@@ -51,11 +51,39 @@ function criteria:Check()
     for poiId, mapIds in pairs(self.list) do
         for mapId in pairs(mapIds) do
             local entry = self.list[poiId][mapId]
+
+            -- Revalidate strict per-location rotating achievements immediately
+            -- before an Area POI becomes an active task. This catches stale
+            -- rewards restored from a previous display snapshot as well as new
+            -- registrations made earlier in the same refresh.
+            local achievementRewards =
+                entry.reward
+                and entry.reward.achievement
+                or nil
+
+            if type(achievementRewards) == "table"
+                and WQA.Achievements
+                and WQA.Achievements.PruneCompletedRotatingAchievementRewards
+            then
+                WQA.Achievements:PruneCompletedRotatingAchievementRewards(
+                    achievementRewards,
+                    mapId
+                )
+
+                if #achievementRewards == 0 then
+                    entry.reward.achievement = nil
+                end
+            end
+
+            local hasTrackedRewards =
+                type(entry.reward) == "table"
+                and next(entry.reward) ~= nil
+
             local poiInfo = C_AreaPoiInfo.GetAreaPOIInfo(mapId, poiId)
             local schedulerInfo = entry.eventScheduler and WQA:GetScheduledAreaPoiInfo(poiId, mapId) or nil
             local scenarioInfo = entry.scenarioEvent and WQA:GetScenarioAreaPoiInfo(poiId, mapId) or nil
 
-            if poiInfo or schedulerInfo or scenarioInfo then
+            if hasTrackedRewards and (poiInfo or schedulerInfo or scenarioInfo) then
                 local link
                 for k, v in pairs(entry.reward) do
                     if k == "custom" or k == "professionSkillup" or k == "gold" then

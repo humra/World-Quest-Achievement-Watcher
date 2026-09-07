@@ -94,28 +94,64 @@ local runestoneRush = {
     { mapID = 2395, criterionName = "Sanctum of the Moon Runestone", patterns = { "Sanctum of the Moon Runestone" } }
 }
 
--- Abundance rotates between four Midnight locations. Map-specific matching
--- means the currently active location can be surfaced only when that criterion
--- is still missing from Prosperous Plentitude.
+-- Abundance rotates between four Midnight locations. The achievement UI's
+-- displayed order is not the same as Blizzard's internal criteria order:
+-- internally Z2 is Zul'Aman and Z3 is Harandar. Do not use criterion positions
+-- or achievement-link bit positions here. Each achievement/location pair is
+-- matched to its exact kill-credit assetID returned by
+-- GetAchievementCriteriaInfo(), and that criterion's live completed flag is the
+-- source of truth. This also avoids localization-sensitive name matching.
 local abundanceLocations = {
     {
         mapID = 2395,
         criterionName = { "Eversong Woods: Watha'nan Crypts", "Eversong: Wath'anan Crypts", "Watha'nan Crypts", "Wath'anan Crypts" },
+        criterionAssetIDs = {
+            [61943] = 257366, -- Prosperous Plentitude: Z1 event complete
+            [62325] = 259994, -- Treasures Aplenty: Treasure Dundun, Z1
+            [62326] = 260000, -- Golden Opportunities: Golden Glow, Z1
+            [62329] = 260005, -- Squash the Competition: Runaways, Z1
+            [62330] = 260009, -- One Bite at a Time: Gigantic Harvest, Z1
+            [62331] = 260013  -- Drops of Prosperity: Rain of Abundance, Z1
+        },
         patterns = { "Abundance", "Watha'nan Crypts", "Wath'anan Crypts" }
     },
     {
         mapID = 2413,
         criterionName = { "Harandar: Floaret Grotto", "Floaret Grotto" },
+        criterionAssetIDs = {
+            [61943] = 257364, -- Z3 event complete
+            [62325] = 259996, -- Treasure Dundun, Z3
+            [62326] = 260003, -- Golden Glow, Z3
+            [62329] = 260007, -- Runaways, Z3
+            [62330] = 260011, -- Gigantic Harvest, Z3
+            [62331] = 260015  -- Rain of Abundance, Z3
+        },
         patterns = { "Abundance", "Floaret Grotto" }
     },
     {
         mapID = 2437,
         criterionName = { "Zul'Aman: Loaknit Den", "Loaknit Den" },
+        criterionAssetIDs = {
+            [61943] = 257365, -- Z2 event complete
+            [62325] = 259995, -- Treasure Dundun, Z2
+            [62326] = 260001, -- Golden Glow, Z2
+            [62329] = 260006, -- Runaways, Z2
+            [62330] = 260010, -- Gigantic Harvest, Z2
+            [62331] = 260014  -- Rain of Abundance, Z2
+        },
         patterns = { "Abundance", "Loaknit Den" }
     },
     {
         mapID = 2405,
         criterionName = { "Voidstorm: Abundant Voidburrow", "Abundant Voidburrow" },
+        criterionAssetIDs = {
+            [61943] = 257362, -- Z4 event complete
+            [62325] = 259997, -- Treasure Dundun, Z4
+            [62326] = 260004, -- Golden Glow, Z4
+            [62329] = 260008, -- Runaways, Z4
+            [62330] = 260012, -- Gigantic Harvest, Z4
+            [62331] = 260016  -- Rain of Abundance, Z4
+        },
         patterns = { "Abundance", "Abundant Voidburrow" }
     }
 }
